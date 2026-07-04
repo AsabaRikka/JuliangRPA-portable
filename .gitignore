@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+build/
+dist/
+JuliangRPA.spec
+
+# Runtime state. Keep this local because it may contain login/session data.
+.auth/
+logs/
+recordings/
+data/*.xlsx
+data/*.csv
+config/ad_presets.yaml

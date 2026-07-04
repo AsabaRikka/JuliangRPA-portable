@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "juliang-ad-rpa"
+version = "0.1.0"
+description = "Python + Playwright CLI automation for creating ads in 巨量."
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.45",
+  "python-dotenv>=1.0",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+juliang-rpa = "juliang_rpa.cli:main"
+juliang-rpa-gui = "juliang_rpa.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,20 @@
+site:
+  base_url: "https://ad.oceanengine.com/"
+  login_url: "https://ad.oceanengine.com/pages/login/index.html"
+  create_ad_url_template: "https://ad.oceanengine.com/ad/web/std/ad/create?aadvid={account_id}&campaign_type=1"
+
+browser:
+  user_data_dir: ".auth/juliang-chrome"
+  headless: false
+  slow_mo_ms: 80
+  timeout_ms: 30000
+  channel: "chrome"
+  use_system_chrome: true
+  executable_path: ""
+  viewport:
+    width: 1920
+    height: 1080
+
+artifacts:
+  logs_dir: "logs"
+  recordings_dir: "recordings"
