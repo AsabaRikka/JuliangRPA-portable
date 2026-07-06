@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 from dataclasses import replace
 from dataclasses import fields
 import queue
@@ -46,11 +47,19 @@ FIELD_SPECS: tuple[tuple[str, str, str], ...] = (
     ("product_image_path", "产品主图图片", "file"),
     ("auto_add_videos", "自动添加视频", "checkbox"),
     ("auto_add_video_count", "自动添加视频数量", "choice"),
+    ("specific_video_count", "指定添加视频数量", "entry"),
+    ("change_douyin_nickname", "修改自定义抖音号昵称", "checkbox"),
+    ("douyin_nickname", "自定义抖音号昵称", "entry"),
     ("submit_project", "提交项目", "checkbox"),
     ("product_selling_points", "产品卖点", "entry"),
     ("call_to_actions", "行动号召", "entry"),
     ("project_name_prefix", "项目名称前缀", "entry"),
 )
+
+EXTRA_CONFIG_LABELS: dict[str, str] = {
+    "account_id_list": "账户 ID 列表（每行一个）",
+    "batch_delay_seconds": "账号间等待秒数",
+}
 
 
 class JuliangRpaApp(tk.Tk):
@@ -172,7 +181,11 @@ class JuliangRpaApp(tk.Tk):
         self.delete_preset_button = ttk.Button(presets, text="删除方案", command=self.delete_preset)
         self.delete_preset_button.grid(row=0, column=4, padx=4)
         self.reload_preset_button = ttk.Button(presets, text="重载", command=self.reload_presets)
-        self.reload_preset_button.grid(row=0, column=5, padx=(4, 0))
+        self.reload_preset_button.grid(row=0, column=5, padx=4)
+        self.export_csv_button = ttk.Button(presets, text="导出CSV", command=self.export_csv_config)
+        self.export_csv_button.grid(row=0, column=6, padx=4)
+        self.import_csv_button = ttk.Button(presets, text="导入CSV", command=self.import_csv_config)
+        self.import_csv_button.grid(row=0, column=7, padx=(4, 0))
 
         account_queue = ttk.LabelFrame(self, text="账户队列", padding=(16, 10))
         account_queue.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
@@ -489,6 +502,143 @@ class JuliangRpaApp(tk.Tk):
         self._refresh_preset_combo()
         self._log("已重载配置方案。")
 
+    def export_csv_config(self) -> None:
+        preset_name = self.preset_var.get().strip() or "未命名方案"
+        default_name = f"{preset_name}.csv"
+        path = filedialog.asksaveasfilename(
+            title="导出CSV配置",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=(("CSV配置", "*.csv"), ("TXT配置", "*.txt"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        values = self._form_values()
+        with Path(path).open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["字段", "名称", "内容"])
+            writer.writerow(["preset_name", "方案名称", preset_name])
+            for field_name, label, kind in FIELD_SPECS:
+                writer.writerow([field_name, label, self._csv_export_value(field_name, values.get(field_name, ""), kind)])
+            for field_name, label in EXTRA_CONFIG_LABELS.items():
+                writer.writerow([field_name, label, values.get(field_name, "")])
+        self._log(f"已导出CSV配置：{path}")
+
+    def import_csv_config(self) -> None:
+        path = filedialog.askopenfilename(
+            title="导入CSV配置",
+            filetypes=(("CSV配置", "*.csv"), ("TXT配置", "*.txt"), ("YAML文件", "*.yaml *.yml"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            values, preset_name = self._read_config_file(Path(path))
+        except Exception as exc:  # noqa: BLE001 - surface import errors in the GUI.
+            messagebox.showerror("导入失败", f"无法导入配置：{exc}")
+            return
+        self._apply_form_values(values)
+        self._sync_account_list_from_text()
+        if preset_name:
+            self.preset_var.set(preset_name)
+        self._log(f"已导入CSV配置：{path}")
+
+    def _read_config_file(self, path: Path) -> tuple[dict[str, object], str]:
+        if path.suffix.lower() == ".csv":
+            return self._read_csv_config(path)
+        try:
+            return self._read_csv_config(path)
+        except Exception:
+            return self._read_yaml_like_config(path)
+
+    def _read_csv_config(self, path: Path) -> tuple[dict[str, object], str]:
+        last_decode_error: UnicodeDecodeError | None = None
+        for encoding in ("utf-8-sig", "gb18030", "gbk", "utf-8"):
+            try:
+                return self._read_csv_config_with_encoding(path, encoding)
+            except UnicodeDecodeError as exc:
+                last_decode_error = exc
+                continue
+        if last_decode_error is not None:
+            raise last_decode_error
+        return self._read_csv_config_with_encoding(path, "utf-8-sig")
+
+    def _read_csv_config_with_encoding(self, path: Path, encoding: str) -> tuple[dict[str, object], str]:
+        with path.open("r", encoding=encoding, newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames or "字段" not in reader.fieldnames or "内容" not in reader.fieldnames:
+                raise ValueError("CSV表头必须包含：字段、内容。")
+            values: dict[str, object] = {}
+            preset_name = ""
+            for row in reader:
+                field_name = (row.get("字段") or "").strip()
+                if not field_name:
+                    continue
+                value = row.get("内容") or ""
+                if field_name == "preset_name":
+                    preset_name = value.strip()
+                else:
+                    values[field_name] = self._csv_import_value(field_name, value)
+        self._validate_imported_values(values)
+        return values, preset_name
+
+    def _csv_export_value(self, field_name: str, value: object, kind: str) -> str:
+        text = "" if value is None else str(value)
+        if kind == "checkbox":
+            return "开启" if self._truthy_config_value(text) else "关闭"
+        return text
+
+    def _csv_import_value(self, field_name: str, value: object) -> str:
+        text = "" if value is None else str(value).strip()
+        field_kinds = {name: kind for name, _label, kind in FIELD_SPECS}
+        if field_kinds.get(field_name) == "checkbox":
+            return "true" if self._truthy_config_value(text) else "false"
+        return text
+
+    def _truthy_config_value(self, value: object) -> bool:
+        return str(value).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+            "是",
+            "启用",
+            "开启",
+            "打开",
+        }
+
+    def _read_yaml_like_config(self, path: Path) -> tuple[dict[str, object], str]:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            raw = yaml.safe_load(handle) or {}
+        if not isinstance(raw, dict):
+            raise ValueError("配置文件内容必须是键值结构。")
+
+        preset_name = str(raw.get("preset_name", "")).strip()
+        if isinstance(raw.get("config"), dict):
+            values = raw["config"]
+        elif isinstance(raw.get("values"), dict):
+            values = raw["values"]
+        elif isinstance(raw.get("presets"), dict):
+            presets = raw["presets"]
+            selected_name = preset_name if preset_name in presets else next(iter(presets), "")
+            if not selected_name:
+                raise ValueError("presets 中没有可导入的方案。")
+            preset_name = str(selected_name)
+            values = presets[selected_name]
+        else:
+            values = raw
+
+        if not isinstance(values, dict):
+            raise ValueError("配置字段必须是键值结构。")
+        normalized = {str(key): "" if value is None else str(value) for key, value in values.items()}
+        self._validate_imported_values(normalized)
+        return normalized, preset_name
+
+    def _validate_imported_values(self, values: dict[str, object]) -> None:
+        known_fields = {name for name, _, _ in FIELD_SPECS} | {"account_id_list", "batch_delay_seconds"}
+        if not any(key in values for key in known_fields):
+            raise ValueError("未识别到有效的RPA配置字段。")
+
     def _account_id_or_warn(self) -> str | None:
         self._sync_account_list_from_text()
         account_id = self.field_vars["account_id"].get().strip()
@@ -523,9 +673,12 @@ class JuliangRpaApp(tk.Tk):
             backup_site_link=values["backup_site_link"],
             product_name=values["product_name"],
             product_image_path=values["product_image_path"],
-            auto_add_videos=values["auto_add_videos"].lower() in {"1", "true", "yes", "是", "启用"},
+            auto_add_videos=self._truthy_config_value(values["auto_add_videos"]),
             auto_add_video_count=values["auto_add_video_count"],
-            submit_project=values["submit_project"].lower() in {"1", "true", "yes", "是", "启用"},
+            specific_video_count=values["specific_video_count"],
+            change_douyin_nickname=self._truthy_config_value(values["change_douyin_nickname"]),
+            douyin_nickname=values["douyin_nickname"],
+            submit_project=self._truthy_config_value(values["submit_project"]),
             product_selling_points=values["product_selling_points"],
             call_to_actions=values["call_to_actions"],
             project_name_prefix=values["project_name_prefix"],
@@ -544,7 +697,7 @@ class JuliangRpaApp(tk.Tk):
 
         defaults = self._new_ad_defaults()
         for name, _, _ in FIELD_SPECS:
-            if not values.get(name) and name != "account_id":
+            if not values.get(name) and name not in {"account_id", "specific_video_count", "douyin_nickname"}:
                 values[name] = str(defaults.get(name, ""))
         return values
 
@@ -558,7 +711,7 @@ class JuliangRpaApp(tk.Tk):
                 widget.insert("1.0", value)
             elif kind == "checkbox":
                 self.field_vars[name].set(
-                    "true" if value.lower() in {"1", "true", "yes", "是", "启用"} else "false"
+                    "true" if self._truthy_config_value(value) else "false"
                 )
             else:
                 self.field_vars[name].set(value)

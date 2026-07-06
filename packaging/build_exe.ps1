@@ -1,10 +1,19 @@
+param(
+    [string]$Version = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $srcRoot = Join-Path $repoRoot "src"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
-$portableName = "JuliangRPA-portable"
+$basePortableName = "JuliangRPA-portable"
+$portableName = $basePortableName
+if (-not [string]::IsNullOrWhiteSpace($Version)) {
+    $safeVersion = $Version.Trim() -replace '[\\/:*?"<>|]', '-'
+    $portableName = "{0}-{1}" -f $basePortableName, $safeVersion
+}
 $portableDir = Join-Path $distRoot $portableName
 $exeName = "JuliangRPA"
 
@@ -71,6 +80,8 @@ foreach ($dir in $browserDirs) {
 $readme = @"
 Juliang Ad RPA Portable
 
+Version: $($Version.Trim())
+
 Usage:
 1. Double click JuliangRPA.exe.
 2. On first use, open the login page, finish login, then save the login state.
@@ -80,5 +91,8 @@ Usage:
 Move/copy this whole folder. Do not copy only the exe.
 "@
 $readme | Set-Content -Encoding UTF8 (Join-Path $portableDir "README.txt")
+if (-not [string]::IsNullOrWhiteSpace($Version)) {
+    $Version.Trim() | Set-Content -Encoding UTF8 (Join-Path $portableDir "VERSION.txt")
+}
 
 Write-Host "Portable package created: $portableDir"

@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+import base64
+import mimetypes
 from pathlib import Path
 import time
 from typing import Callable
@@ -64,6 +66,9 @@ class NewAdOptions:
     product_image_path: str = r"C:\Users\tanyu\Desktop\icon108\我的保安人生.jpeg"
     auto_add_videos: bool = False
     auto_add_video_count: str = "40"
+    specific_video_count: str = ""
+    change_douyin_nickname: bool = False
+    douyin_nickname: str = ""
     submit_project: bool = False
     ensure_event_asset: bool = True
     dry_run: bool = False
@@ -146,6 +151,10 @@ async def run_new_ad(
 
         async with step(progress, "设置原生锚点自动生成"):
             await enable_native_anchor_auto_generate(page)
+
+        if options.change_douyin_nickname:
+            async with step(progress, "修改自定义抖音号昵称"):
+                await fill_custom_douyin_nickname(page, options)
 
         async with step(progress, "保存配置后快照"):
             screenshot_path, html_path = await save_debug_snapshot(
@@ -233,7 +242,7 @@ async def choose_byte_mini_game(page: Page, options: NewAdOptions) -> None:
     )
     await expect(page.get_by_text(options.mini_game_name, exact=True).first).to_be_visible()
     await confirm_pending_modal(page)
-    await polite_pause(page, 300)
+    await polite_pause(page, 150)
 
 
 async def optimization_goal_is_empty(page: Page) -> bool:
@@ -279,7 +288,6 @@ async def ensure_event_asset_and_events(
             configure_callback=added_asset,
         )
     async with step(progress, "切回广告创建页"):
-        await ad_page.bring_to_front()
         await normalize_page_zoom(ad_page)
 
 
@@ -1207,7 +1215,7 @@ async def click_douyin_account_result(page: Page, options: NewAdOptions) -> None
         )
         if not scrolled:
             break
-        await polite_pause(page, 500)
+        await polite_pause(page, 250)
 
     raise RuntimeError("Cannot find douyin account result.")
 
@@ -1978,54 +1986,197 @@ async def fill_project_name(page: Page, options: NewAdOptions) -> None:
     await polite_pause(page, 250)
 
 
-async def enable_native_anchor_auto_generate(page: Page) -> None:
+async def fill_custom_douyin_nickname(page: Page, options: NewAdOptions) -> None:
+    nickname = options.douyin_nickname.strip()
+    if not nickname:
+        raise RuntimeError("已启用修改自定义抖音号昵称，但昵称为空。")
     try:
-        await scroll_text_into_view(page, "原生锚点")
+        await scroll_text_into_view(page, "自定义抖音号昵称")
     except Exception:
-        pass
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        await polite_pause(page, 400)
 
-    if not await native_anchor_available(page):
-        return
+    placeholder = "请输入自定义抖音号昵称，在2-10个字符范围内"
+    field = page.get_by_role("textbox", name=placeholder).first
+    try:
+        await expect(field).to_be_visible(timeout=4_000)
+    except PlaywrightTimeoutError:
+        box = await custom_douyin_nickname_box(page)
+        if not box:
+            raise RuntimeError("找不到自定义抖音号昵称输入框。")
+        await page.mouse.click(box["x"], box["y"])
+        await page.keyboard.press("Control+A")
+        await paste_text(page, nickname)
+    else:
+        await fill_text_control(field, nickname)
+    await polite_pause(page, 250)
 
-    await click_native_anchor_auto_generate(page)
-    await polite_pause(page, 300)
 
-
-async def native_anchor_state(page: Page) -> dict[str, object]:
+async def custom_douyin_nickname_box(page: Page) -> dict[str, float] | None:
     return await page.evaluate(
         """() => {
-            const hasBox = node => {
+            const isVisible = node => {
                 const rect = node.getBoundingClientRect();
                 const style = window.getComputedStyle(node);
                 return rect.width > 0
                     && rect.height > 0
                     && rect.bottom > 0
                     && rect.top < window.innerHeight
-                    && rect.right > 0
-                    && rect.left < window.innerWidth
                     && style.display !== 'none'
                     && style.visibility !== 'hidden';
             };
             const clean = node => (node.innerText || node.textContent || node.getAttribute('aria-label') || '')
                 .replace(/\\s+/g, ' ')
                 .trim();
-            const classTokens = node => (node?.className?.toString?.() || '')
-                .split(/\\s+/)
-                .filter(Boolean);
+            const direct = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'))
+                .filter(isVisible)
+                .find(node => {
+                    const text = [
+                        node.getAttribute('placeholder') || '',
+                        node.getAttribute('aria-label') || '',
+                        node.getAttribute('name') || '',
+                    ].join(' ');
+                    return text.includes('自定义抖音号昵称');
+                });
+            if (direct) {
+                const rect = direct.getBoundingClientRect();
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            }
+            const labels = Array.from(document.querySelectorAll('label, span, div, p'))
+                .filter(node => isVisible(node) && clean(node).includes('自定义抖音号昵称'));
+            for (const label of labels) {
+                let container = label;
+                for (let depth = 0; container && depth < 8; depth += 1, container = container.parentElement) {
+                    const input = Array.from(container.querySelectorAll('input, textarea, [contenteditable="true"]'))
+                        .filter(isVisible)
+                        .find(node => {
+                            const placeholder = node.getAttribute('placeholder') || '';
+                            return placeholder.includes('自定义抖音号昵称') || placeholder.includes('请输入');
+                        });
+                    if (!input) continue;
+                    const rect = input.getBoundingClientRect();
+                    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                }
+            }
+            return null;
+        }"""
+    )
+
+
+async def enable_native_anchor_auto_generate(page: Page) -> None:
+    try:
+        await scroll_text_into_view(page, "原生锚点")
+    except Exception:
+        pass
+    await scroll_native_anchor_into_view(page)
+
+    if not await native_anchor_available(page):
+        return
+
+    try:
+        await click_native_anchor_auto_generate(page)
+    except RuntimeError as exc:
+        if "找不到原生锚点自动生成选项" in str(exc):
+            return
+        raise
+    await polite_pause(page, 300)
+
+
+async def scroll_native_anchor_into_view(page: Page) -> bool:
+    scrolled = await page.evaluate(
+        """() => {
+            const isRendered = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const area = node => {
+                const rect = node.getBoundingClientRect();
+                return rect.width * rect.height;
+            };
+            const containers = Array.from(document.querySelectorAll(
+                '[data-auto-id="NativeAnchorWrapperModule"], [data-auto-id="NativeAnchorModule"], [data-e2e="createad_anchorSelect"], div, section'
+            ))
+                .filter(isRendered)
+                .filter(node => {
+                    const text = clean(node);
+                    return text.includes('设置锚点')
+                        && text.includes('不启用')
+                        && text.includes('自动生成');
+                })
+                .sort((a, b) => {
+                    const aStable = a.matches('[data-auto-id="NativeAnchorWrapperModule"], [data-auto-id="NativeAnchorModule"], [data-e2e="createad_anchorSelect"]') ? 0 : 1;
+                    const bStable = b.matches('[data-auto-id="NativeAnchorWrapperModule"], [data-auto-id="NativeAnchorModule"], [data-e2e="createad_anchorSelect"]') ? 0 : 1;
+                    if (aStable !== bStable) return aStable - bStable;
+                    return area(a) - area(b);
+                });
+            const container = containers[0];
+            if (!container) return false;
+            container.scrollIntoView({ block: 'center', inline: 'nearest' });
+            return true;
+        }"""
+    )
+    if scrolled:
+        await polite_pause(page, 500)
+    return bool(scrolled)
+
+
+async def native_anchor_state(page: Page) -> dict[str, object]:
+    return await page.evaluate(
+        """() => {
+            const isRendered = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const inViewport = node => {
+                if (!isRendered(node)) return false;
+                const rect = node.getBoundingClientRect();
+                return rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && rect.right > 0
+                    && rect.left < window.innerWidth;
+            };
+            const clean = node => (node.innerText || node.textContent || node.getAttribute('aria-label') || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+            const classText = node => node?.className?.toString?.() || '';
+            const isCheckedNode = node => {
+                if (!node) return false;
+                const input = node.matches?.('input[type="radio"]') ? node : node.querySelector?.('input[type="radio"]');
+                if (input?.checked === true) return true;
+                if (node.getAttribute?.('aria-checked') === 'true') return true;
+                const checked = node.closest?.(
+                    '.ovui-radio-item--checked, .ovui-radio--checked, .oc-radio--checked, .oc-radio-group-item--checked, .checked, .active'
+                );
+                if (checked && !classText(checked).includes('unchecked')) return true;
+                const cls = classText(node);
+                return /(^|\\s)(.*checked|active|selected)(\\s|$)/i.test(cls) && !/unchecked/i.test(cls);
+            };
             const asState = (container, label) => {
                 const input = label.querySelector?.('input[type="radio"][value="2"]')
                     || container.querySelector?.('input[type="radio"][value="2"]')
                     || label.querySelector?.('input[type="radio"], [role="radio"]')
                     || null;
-                const selected = Boolean(input && input.checked === true);
+                const radioItem = label.closest?.('.ovui-radio-item, .ovui-radio, .oc-radio-group-item, label, [role="radio"]') || label;
+                const selected = Boolean(isCheckedNode(input) || isCheckedNode(label) || isCheckedNode(radioItem));
                 const labelRect = label.getBoundingClientRect();
                 const inputRect = input?.getBoundingClientRect?.();
+                const clickable = radioItem || label;
+                const clickableRect = clickable.getBoundingClientRect();
                 return {
                     found: true,
                     selected,
                     target: {
-                        x: inputRect && inputRect.width > 0 ? inputRect.x + inputRect.width / 2 : labelRect.x + labelRect.width / 2,
-                        y: inputRect && inputRect.height > 0 ? inputRect.y + inputRect.height / 2 : labelRect.y + labelRect.height / 2,
+                        x: clickableRect.width > 0 ? clickableRect.x + clickableRect.width / 2 : labelRect.x + labelRect.width / 2,
+                        y: clickableRect.height > 0 ? clickableRect.y + clickableRect.height / 2 : labelRect.y + labelRect.height / 2,
                     },
                     label: {
                         x: labelRect.x + labelRect.width / 2,
@@ -2036,10 +2187,11 @@ async def native_anchor_state(page: Page) -> dict[str, object]:
             const candidateContainers = Array.from(document.querySelectorAll(
                 '[data-auto-id="NativeAnchorWrapperModule"], [data-auto-id="NativeAnchorModule"], [data-e2e="createad_anchorSelect"]'
             ))
-                .filter(hasBox)
+                .filter(isRendered)
                 .filter(node => {
                     const text = clean(node);
-                    return text.includes('原生锚点') || text.includes('设置锚点');
+                    return (text.includes('原生锚点') || text.includes('设置锚点'))
+                        && text.includes('自动生成');
                 })
                 .filter(node => node.querySelector('[data-e2e="createad_anchorSelect__createAnchorSelect__ocRadioGroup_1_radio"], input[type="radio"][value="2"]'))
                 .sort((a, b) => {
@@ -2052,16 +2204,18 @@ async def native_anchor_state(page: Page) -> dict[str, object]:
             const stableContainer = candidateContainers[0] || null;
             const stableLabel = stableContainer?.querySelector?.('[data-e2e="createad_anchorSelect__createAnchorSelect__ocRadioGroup_1_radio"]')
                 || stableContainer?.querySelector?.('input[type="radio"][value="2"]')?.closest?.('label')
+                || Array.from(stableContainer?.querySelectorAll?.('label, div, span') || [])
+                    .find(node => clean(node) === '自动生成')
                 || null;
-            if (stableContainer && stableLabel && hasBox(stableLabel)) {
+            if (stableContainer && stableLabel && isRendered(stableLabel)) {
                 return asState(stableContainer, stableLabel);
             }
             const area = node => {
                 const rect = node.getBoundingClientRect();
                 return rect.width * rect.height;
             };
-            const visibleNodes = selector => Array.from(document.querySelectorAll(selector)).filter(hasBox);
-            const settingLabels = visibleNodes('label, span, div')
+            const renderedNodes = selector => Array.from(document.querySelectorAll(selector)).filter(isRendered);
+            const settingLabels = renderedNodes('label, span, div')
                 .filter(node => clean(node) === '设置锚点');
             const rowContainers = settingLabels
                 .map(node => node.closest('.oc-row, .byted-form-item, .ovui-form-item, [class*="form"], [class*="row"]') || node.parentElement)
@@ -2070,11 +2224,10 @@ async def native_anchor_state(page: Page) -> dict[str, object]:
                     const text = clean(node);
                     return text.includes('不启用') && text.includes('自动生成');
                 });
-            const widerContainers = visibleNodes('div, section, article')
+            const widerContainers = renderedNodes('div, section, article')
                 .filter(node => {
                     const text = clean(node);
-                    return text.includes('原生锚点')
-                        && text.includes('设置锚点')
+                    return text.includes('设置锚点')
                         && text.includes('不启用')
                         && text.includes('自动生成');
                 });
@@ -2083,18 +2236,21 @@ async def native_anchor_state(page: Page) -> dict[str, object]:
                 .sort((a, b) => area(a) - area(b));
             const container = containers[0];
             if (!container) return { found: false, selected: false };
-            const nodes = visibleNodes.call(null, 'label, span, div, input[type="radio"], [role="radio"]')
+            const nodes = renderedNodes.call(null, 'label, span, div, input[type="radio"], [role="radio"]')
                 .filter(node => container.contains(node));
             const autoText = nodes.find(node => clean(node) === '自动生成')
-                || visibleNodes('label').find(node => container.contains(node) && clean(node).includes('自动生成'));
+                || renderedNodes('label').find(node => container.contains(node) && clean(node).includes('自动生成'));
             if (!autoText) return { found: true, selected: false };
-            const label = autoText.closest('label') || autoText.parentElement || autoText;
+            const label = autoText.closest('.ovui-radio-item, .ovui-radio, .oc-radio-group-item, label, [role="radio"]')
+                || autoText.closest('label')
+                || autoText.parentElement
+                || autoText;
             let input = label.querySelector?.('input[type="radio"], [role="radio"]')
                 || autoText.querySelector?.('input[type="radio"], [role="radio"]')
                 || null;
             if (!input) {
                 const labelRect = label.getBoundingClientRect();
-                const radios = visibleNodes('input[type="radio"], [role="radio"]')
+                const radios = renderedNodes('input[type="radio"], [role="radio"]')
                     .filter(node => container.contains(node))
                     .sort((a, b) => {
                         const ar = a.getBoundingClientRect();
@@ -2117,39 +2273,119 @@ async def native_anchor_available(page: Page) -> bool:
 
 
 async def click_native_anchor_auto_generate(page: Page) -> None:
-    state = await native_anchor_state(page)
-    if not state.get("found"):
-        raise RuntimeError("找不到原生锚点自动生成选项")
-    if state.get("selected"):
-        return
-    target = state.get("target") or state.get("label")
-    if not isinstance(target, dict):
-        raise RuntimeError("找不到原生锚点自动生成选项")
-    await page.mouse.click(float(target["x"]), float(target["y"]))
-    await polite_pause(page, 500)
-    state = await native_anchor_state(page)
-    if state.get("selected"):
-        return
-    label = state.get("label")
-    if isinstance(label, dict):
-        await page.mouse.click(float(label["x"]), float(label["y"]))
-        await polite_pause(page, 500)
-    state = await native_anchor_state(page)
-    if state.get("selected"):
-        return
-    auto_labels = page.locator('[data-e2e="createad_anchorSelect__createAnchorSelect__ocRadioGroup_1_radio"]')
-    for index in range(await auto_labels.count()):
-        candidate = auto_labels.nth(index)
-        try:
-            if await candidate.is_visible(timeout=300):
-                await candidate.click(force=True, timeout=2_000)
-                await polite_pause(page, 700)
-                break
-        except PlaywrightTimeoutError:
+    last_state: dict[str, object] = {}
+    for _ in range(4):
+        await scroll_native_anchor_into_view(page)
+        state = await native_anchor_state(page)
+        last_state = state
+        if not state.get("found"):
+            await polite_pause(page, 500)
             continue
-    state = await native_anchor_state(page)
-    if not state.get("selected"):
-        raise RuntimeError("原生锚点自动生成未能选中")
+        if state.get("selected"):
+            return
+        target = state.get("target") or state.get("label")
+        if isinstance(target, dict):
+            await page.mouse.click(float(target["x"]), float(target["y"]))
+            await polite_pause(page, 700)
+        if (await native_anchor_state(page)).get("selected"):
+            return
+        clicked = await click_native_anchor_auto_generate_by_dom(page)
+        if clicked:
+            await polite_pause(page, 800)
+        if (await native_anchor_state(page)).get("selected"):
+            return
+        clicked = await click_native_anchor_auto_generate_by_text(page)
+        if clicked:
+            await polite_pause(page, 800)
+        if (await native_anchor_state(page)).get("selected"):
+            return
+
+    if not last_state.get("found"):
+        return
+    raise RuntimeError("原生锚点自动生成未能选中")
+
+
+async def click_native_anchor_auto_generate_by_text(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isRendered = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const labels = Array.from(document.querySelectorAll('span, div, label'))
+                    .filter(isRendered)
+                    .filter(node => clean(node) === '自动生成');
+                const label = labels.find(node => {
+                    const parent = node.closest('.oc-row, .byted-form-item, .ovui-form-item, [class*="row"], [class*="form"]')
+                        || node.parentElement;
+                    const text = parent ? clean(parent) : '';
+                    return text.includes('设置锚点') || text.includes('原生锚点') || text.includes('不启用');
+                }) || labels[0] || null;
+                if (!label) return false;
+                const clickable = label.closest('.ovui-radio-item, .ovui-radio, .oc-radio-group-item, label, [role="radio"]')
+                    || label.parentElement
+                    || label;
+                clickable.scrollIntoView({ block: 'center', inline: 'nearest' });
+                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    clickable.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                }
+                return true;
+            }"""
+        )
+    )
+
+
+async def click_native_anchor_auto_generate_by_dom(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isRendered = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const area = node => {
+                    const rect = node.getBoundingClientRect();
+                    return rect.width * rect.height;
+                };
+                const containers = Array.from(document.querySelectorAll(
+                    '[data-auto-id="NativeAnchorWrapperModule"], [data-auto-id="NativeAnchorModule"], [data-e2e="createad_anchorSelect"], div, section'
+                ))
+                    .filter(isRendered)
+                    .filter(node => {
+                        const text = clean(node);
+                        return text.includes('设置锚点')
+                            && text.includes('不启用')
+                            && text.includes('自动生成');
+                    })
+                    .sort((a, b) => area(a) - area(b));
+                const container = containers[0];
+                if (!container) return false;
+                const autoText = Array.from(container.querySelectorAll('label, div, span'))
+                    .filter(isRendered)
+                    .find(node => clean(node) === '自动生成');
+                if (!autoText) return false;
+                const clickable = autoText.closest('.ovui-radio-item, .ovui-radio, .oc-radio-group-item, label, [role="radio"]')
+                    || autoText.closest('label')
+                    || autoText;
+                clickable.scrollIntoView({ block: 'center', inline: 'nearest' });
+                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    clickable.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                }
+                return true;
+            }"""
+        )
+    )
 
 
 async def upload_product_main_image(page: Page, options: NewAdOptions) -> None:
@@ -2164,17 +2400,9 @@ async def upload_product_main_image(page: Page, options: NewAdOptions) -> None:
 
     upload_dialog = product_image_upload_drawer(page)
     await expect(upload_dialog).to_be_visible(timeout=10_000)
-    await click_first_visible(upload_dialog.get_by_text("本地上传", exact=True), "产品主图本地上传")
-    await polite_pause(page, 300)
+    await select_product_local_upload_tab(page)
 
-    file_input = upload_dialog.locator('input[type="file"]').first
-    if await file_input.count() >= 1:
-        await file_input.set_input_files(str(image_path), timeout=30_000)
-    else:
-        async with page.expect_file_chooser(timeout=10_000) as chooser_info:
-            await click_product_upload_area(page)
-        chooser = await chooser_info.value
-        await chooser.set_files(str(image_path), timeout=30_000)
+    await set_product_image_file(page, upload_dialog, image_path)
 
     await wait_for_product_image_uploaded(page, image_path.name)
     confirm = upload_dialog.get_by_role("button", name="确定").last
@@ -2204,7 +2432,131 @@ async def upload_product_main_image(page: Page, options: NewAdOptions) -> None:
     await polite_pause(page, 300)
 
 
+async def select_product_local_upload_tab(page: Page) -> None:
+    for _ in range(3):
+        clicked = await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && clean(node).includes('本地上传'));
+                const dialog = dialogs.at(-1);
+                if (!dialog) return false;
+                const stable = dialog.querySelector('[data-e2e$="ocDrawer_tabs_imageUpload"]');
+                const textNode = Array.from(dialog.querySelectorAll('div,span,button'))
+                    .filter(isVisible)
+                    .find(node => clean(node) === '本地上传');
+                const target = stable || textNode;
+                if (!target) return false;
+                const clickable = target.closest('.ovui-tabs__tab, .ovui-tabs__tab-btn, [role="tab"], button')
+                    || target;
+                clickable.scrollIntoView({ block: 'center', inline: 'nearest' });
+                for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
+                    clickable.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                }
+                return true;
+            }"""
+        )
+        if not clicked:
+            raise RuntimeError("找不到产品主图本地上传标签")
+        await polite_pause(page, 500)
+        if await product_local_upload_tab_active(page):
+            return
+    raise RuntimeError("产品主图本地上传标签未切换成功")
+
+
+async def product_local_upload_tab_active(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && clean(node).includes('本地上传'));
+                const dialog = dialogs.at(-1);
+                if (!dialog) return false;
+                const activeTab = dialog.querySelector('[data-e2e$="ocDrawer_tabs_imageUpload"]')?.closest('.ovui-tabs__tab');
+                const tabIsActive = activeTab?.className?.toString?.().includes('active');
+                const uploadSurface = dialog.querySelector('[data-auto-id="create-upload-select"]');
+                return Boolean(tabIsActive || (uploadSurface && isVisible(uploadSurface)));
+            }"""
+        )
+    )
+
+
+async def set_product_image_file(page: Page, upload_dialog: Locator, image_path: Path) -> None:
+    await wait_for_product_upload_surface(page)
+
+    fast_input = await set_product_file_input_if_available(page, upload_dialog, image_path, timeout_ms=5_000)
+    if fast_input:
+        return
+
+    await click_product_upload_area(page)
+    await polite_pause(page, 250)
+    clicked_input = await set_product_file_input_if_available(page, upload_dialog, image_path, timeout_ms=5_000)
+    if clicked_input:
+        return
+
+    try:
+        async with page.expect_file_chooser(timeout=3_000) as chooser_info:
+            await click_product_upload_area(page)
+        chooser = await chooser_info.value
+        await chooser.set_files(str(image_path), timeout=30_000)
+        return
+    except PlaywrightTimeoutError:
+        pass
+
+    if await dispatch_product_image_drop(page, image_path):
+        return
+
+    raise RuntimeError("找不到产品主图本地上传文件入口")
+
+
+async def set_product_file_input_if_available(
+    page: Page,
+    upload_dialog: Locator,
+    image_path: Path,
+    timeout_ms: int,
+) -> bool:
+    for locator in (
+        upload_dialog.locator('input[type="file"]').first,
+        page.locator('input[type="file"]').last,
+    ):
+        try:
+            if await locator.count() >= 1:
+                await locator.set_input_files(str(image_path), timeout=timeout_ms)
+                return True
+        except PlaywrightError:
+            continue
+    return False
+
+
 async def auto_add_videos(page: Page, options: NewAdOptions) -> None:
+    specific_count = normalize_specific_video_count(options.specific_video_count)
+    if specific_count is not None:
+        await auto_add_specific_video_count(page, specific_count)
+        return
+
     count = normalize_video_page_size(options.auto_add_video_count)
     await click_add_video_button(page)
 
@@ -2212,11 +2564,86 @@ async def auto_add_videos(page: Page, options: NewAdOptions) -> None:
     await expect(video_dialog).to_be_visible(timeout=10_000)
     actual_count = await set_video_page_size(page, count)
     await select_current_video_page(page)
-    confirm = video_dialog.get_by_role("button", name="确定").last
-    await expect(confirm).to_be_enabled(timeout=10_000)
-    await confirm.click()
+    await confirm_video_material_selection(page)
+    await handle_video_guide_branch_if_needed(page)
     await wait_for_video_selection_applied(page, actual_count)
     await polite_pause(page, 300)
+
+
+async def auto_add_specific_video_count(page: Page, requested_count: int) -> None:
+    await click_add_video_button(page)
+
+    video_dialog = video_material_dialog(page)
+    await expect(video_dialog).to_be_visible(timeout=10_000)
+
+    total_count = await current_video_total_count(page)
+    selection_limit = await current_video_selection_limit(page)
+    target_count = requested_count
+    if total_count:
+        target_count = min(target_count, total_count)
+    if selection_limit:
+        target_count = min(target_count, selection_limit)
+    if target_count <= 0:
+        raise RuntimeError("指定添加视频数量必须大于 0。")
+
+    page_size = await set_video_page_size(page, 160)
+    if not page_size:
+        page_size = 160
+    await wait_for_video_cards_loaded(page)
+    selection_limit = selection_limit or await current_video_selection_limit(page)
+    if selection_limit:
+        target_count = min(target_count, selection_limit)
+
+    selected_count = await current_video_selected_count(page)
+    remaining_count = max(target_count - selected_count, 0)
+    page_guard = 0
+    while remaining_count > 0:
+        if remaining_count >= page_size:
+            await select_current_video_page(page)
+            expected_count = min(target_count, selected_count + page_size)
+            selected_count = await wait_for_video_selected_progress(page, expected_count, timeout=10_000)
+        else:
+            selected_count = await select_video_cards_within_current_page_until(
+                page,
+                target_count,
+            )
+            if selected_count < target_count:
+                raise RuntimeError(
+                    f"当前页内滚动补选视频不足，目标 {target_count}，当前已选 {selected_count}。"
+                )
+        selected_count = await current_video_selected_count(page)
+        remaining_count = max(target_count - selected_count, 0)
+        if remaining_count <= 0:
+            break
+
+        page_guard += 1
+        if page_guard > 20:
+            raise RuntimeError("自动添加视频翻页次数异常，已停止。")
+        if not await goto_next_video_page(page):
+            break
+        await wait_for_video_cards_loaded(page)
+
+    selected_count = await current_video_selected_count(page)
+    if selected_count < target_count:
+        raise RuntimeError(f"视频库可选视频不足或翻页失败，目标 {target_count}，当前已选 {selected_count}。")
+
+    await confirm_video_material_selection(page)
+    await handle_video_guide_branch_if_needed(page)
+    await wait_for_video_selection_applied(page, target_count)
+    await polite_pause(page, 300)
+
+
+def normalize_specific_video_count(value: str) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise RuntimeError(f"指定添加视频数量无效：{value}") from exc
+    if count <= 0:
+        raise RuntimeError("指定添加视频数量必须大于 0。")
+    return count
 
 
 def normalize_video_page_size(value: str) -> int:
@@ -2532,52 +2959,1359 @@ async def select_current_video_page(page: Page) -> None:
     await page.wait_for_function(
         """() => {
             const text = document.body?.innerText || '';
-            return /已选择\\d+\\/800/.test(text);
+            return /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(text);
         }""",
         timeout=8_000,
     )
     await polite_pause(page, 300)
 
 
-async def wait_for_video_selection_applied(page: Page, count: int) -> None:
-    await page.wait_for_function(
-        """count => {
-            const text = document.body?.innerText || '';
-            return text.includes(`视频 (${count}个)`) || text.includes(`视频(${count}个)`);
-        }""",
-        arg=count,
-        timeout=15_000,
+async def current_video_total_count(page: Page) -> int | None:
+    return await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return null;
+            const text = drawer.innerText || drawer.textContent || '';
+            const match = text.match(/共\\s*(\\d+)\\s*(?:个视频|条记录)/);
+            return match ? Number(match[1]) : null;
+        }"""
     )
+
+
+async def current_video_selected_count(page: Page) -> int:
+    value = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return 0;
+            const text = drawer.innerText || drawer.textContent || '';
+            const match = text.match(/已选择\\s*(\\d+)\\s*\\/\\s*\\d+/);
+            return match ? Number(match[1]) : 0;
+        }"""
+    )
+    return int(value or 0)
+
+
+async def current_video_selection_limit(page: Page) -> int | None:
+    value = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return null;
+            const text = drawer.innerText || drawer.textContent || '';
+            const match = text.match(/已选择\\s*\\d+\\s*\\/\\s*(\\d+)/);
+            return match ? Number(match[1]) : null;
+        }"""
+    )
+    return int(value) if value else None
+
+
+async def visible_video_card_count(page: Page) -> int:
+    return int(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const drawers = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+                const drawer = drawers.at(-1);
+                if (!drawer) return 0;
+                let cards = Array.from(drawer.querySelectorAll('.create-material-list-card-item')).filter(isVisible);
+                if (cards.length <= 0) {
+                    cards = Array.from(drawer.querySelectorAll('.oc-create-material-card-wrapper')).filter(isVisible);
+                }
+                return cards
+                    .filter(isVisible)
+                    .length;
+            }"""
+        )
+    )
+
+
+async def select_video_cards_on_current_page(
+    page: Page,
+    count: int,
+    *,
+    only_unselected: bool = False,
+) -> int:
+    boxes = await page.evaluate(
+        """({ count, onlyUnselected }) => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return [];
+            let cards = Array.from(drawer.querySelectorAll('.create-material-list-card-item')).filter(isVisible);
+            if (cards.length <= 0) {
+                cards = Array.from(drawer.querySelectorAll('.oc-create-material-card-wrapper')).filter(isVisible);
+            }
+            const isSelected = node => {
+                const input = node.querySelector?.('input[type="checkbox"]');
+                if (input?.checked) return true;
+                const checkbox = node.querySelector?.('[role="checkbox"], .ovui-checkbox, .oc-checkbox');
+                if (checkbox?.getAttribute?.('aria-checked') === 'true') return true;
+                const checkboxClass = checkbox?.className?.toString?.() || '';
+                const nodeClass = node.className?.toString?.() || '';
+                if (/checked|selected/i.test(checkboxClass) && !/unchecked/i.test(checkboxClass)) return true;
+                if (/checked|selected/i.test(nodeClass) && !/unchecked/i.test(nodeClass)) return true;
+                return Boolean(node.querySelector?.(
+                    'input[type="checkbox"]:checked, [aria-checked="true"], .ovui-checkbox--checked, .oc-checkbox--checked, [class*="selected"]'
+                ));
+            };
+            if (onlyUnselected) {
+                cards = cards.filter(node => !isSelected(node));
+            }
+            const drawerRect = drawer.getBoundingClientRect();
+            const safeRight = drawerRect.right - 28;
+            const scrollBox = drawer.querySelector('.create-material-list-pagination-list-content')
+                || drawer.querySelector('.create-material-list-pagination-list')
+                || drawer;
+            const boxRect = scrollBox.getBoundingClientRect();
+            cards = cards.filter(node => {
+                const rect = node.getBoundingClientRect();
+                return rect.bottom > boxRect.top + 12
+                    && rect.top < boxRect.bottom - 12
+                    && rect.right > boxRect.left
+                    && rect.left < boxRect.right;
+            });
+            const points = cards.map(node => {
+                const checkbox = Array.from(node.querySelectorAll(
+                    '.ovui-checkbox__inner, .oc-checkbox__inner, [role="checkbox"]'
+                )).find(isVisible);
+                const target = checkbox || node;
+                const rect = target.getBoundingClientRect();
+                const cardRect = node.getBoundingClientRect();
+                const visibleTop = Math.max(cardRect.top, boxRect.top);
+                const visibleBottom = Math.min(cardRect.bottom, boxRect.bottom);
+                const clickY = Math.min(visibleTop + 18, visibleBottom - 8);
+                return {
+                    x: rect.left + Math.min(Math.max(rect.width / 2, 6), Math.max(rect.width - 4, 6)),
+                    y: Number.isFinite(clickY) ? clickY : rect.top + Math.min(Math.max(rect.height / 2, 6), Math.max(rect.height - 4, 6)),
+                    cardRight: cardRect.right
+                };
+            });
+            const safePoints = points.filter(point =>
+                point.x < safeRight
+                && point.y > boxRect.top + 4
+                && point.y < boxRect.bottom - 4
+            );
+            return safePoints.slice(0, count).map(point => ({ x: point.x, y: point.y }));
+        }""",
+        {"count": count, "onlyUnselected": only_unselected},
+    )
+    for index, box in enumerate(boxes, start=1):
+        await page.mouse.click(box["x"], box["y"])
+        if index % 20 == 0:
+            await polite_pause(page, 100)
+    await polite_pause(page, 500)
+    return len(boxes)
+
+
+async def select_video_cards_within_current_page(page: Page, count: int) -> int:
+    clicked_total = 0
+    await reset_video_material_list_scroll(page)
+    stagnant_rounds = 0
+    for _ in range(30):
+        if clicked_total >= count:
+            break
+        clicked = await select_video_cards_on_current_page(
+            page,
+            count - clicked_total,
+            only_unselected=True,
+        )
+        if clicked > 0:
+            clicked_total += clicked
+            stagnant_rounds = 0
+        else:
+            stagnant_rounds += 1
+        if clicked_total >= count:
+            break
+        scrolled = await scroll_video_material_list_down(page)
+        if not scrolled:
+            break
+        await polite_pause(page, 250)
+        if stagnant_rounds >= 3:
+            break
+    return clicked_total
+
+
+async def select_video_cards_within_current_page_until(page: Page, target_count: int) -> int:
+    selected_count = await current_video_selected_count(page)
+    if selected_count >= target_count:
+        return selected_count
+
+    await reset_video_material_list_scroll(page)
+    stagnant_rounds = 0
+    last_selected = selected_count
+    for _ in range(40):
+        selected_count = await current_video_selected_count(page)
+        remaining = max(target_count - selected_count, 0)
+        if remaining <= 0:
+            return selected_count
+
+        clicked = await select_video_cards_on_current_page(
+            page,
+            remaining,
+            only_unselected=True,
+        )
+        if clicked > 0:
+            selected_count = await wait_for_video_selected_progress(
+                page,
+                min(target_count, selected_count + clicked),
+                timeout=5_000,
+            )
+
+        if selected_count >= target_count:
+            return selected_count
+
+        if selected_count <= last_selected:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+        last_selected = selected_count
+
+        scrolled = await scroll_video_material_list_down(page)
+        if not scrolled or stagnant_rounds >= 3:
+            return selected_count
+        await polite_pause(page, 250)
+
+    return await current_video_selected_count(page)
+
+
+async def reset_video_material_list_scroll(page: Page) -> None:
+    await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return false;
+            const target = drawer.querySelector('.create-material-list-pagination-list-content')
+                || drawer.querySelector('.create-material-list-pagination-list');
+            if (target && target.scrollHeight > target.clientHeight + 20) {
+                target.scrollTop = 0;
+                return true;
+            }
+            return false;
+        }"""
+    )
+    await polite_pause(page, 200)
+
+
+async def scroll_video_material_list_down(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const drawers = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+                const drawer = drawers.at(-1);
+                if (!drawer) return false;
+                const target = drawer.querySelector('.create-material-list-pagination-list-content')
+                    || drawer.querySelector('.create-material-list-pagination-list');
+                if (!target) return false;
+                const before = target.scrollTop;
+                const step = Math.max(260, Math.floor(target.clientHeight * 0.75));
+                target.scrollTop = Math.min(target.scrollTop + step, target.scrollHeight - target.clientHeight);
+                return target.scrollTop > before + 2;
+            }"""
+        )
+    )
+
+
+async def wait_for_video_cards_loaded(page: Page) -> None:
+    try:
+        await page.wait_for_function(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const drawers = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+                const drawer = drawers.at(-1);
+                if (!drawer) return false;
+                let cards = Array.from(drawer.querySelectorAll('.create-material-list-card-item')).filter(isVisible);
+                if (cards.length <= 0) {
+                    cards = Array.from(drawer.querySelectorAll('.oc-create-material-card-wrapper')).filter(isVisible);
+                }
+                return cards.length > 0;
+            }""",
+            timeout=20_000,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError("视频列表加载超时，未出现可选择的视频卡片。") from exc
+
+
+async def wait_for_video_selected_progress(page: Page, count: int, timeout: int) -> int:
+    try:
+        await page.wait_for_function(
+            """count => {
+                const text = document.body?.innerText || '';
+                const match = text.match(/已选择\\s*(\\d+)\\s*\\/\\s*\\d+/);
+                return match && Number(match[1]) >= count;
+            }""",
+            arg=count,
+            timeout=timeout,
+        )
+    except PlaywrightTimeoutError:
+        pass
+    return await current_video_selected_count(page)
+
+
+async def confirm_video_material_selection(page: Page) -> None:
+    box = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => {
+                const text = node.innerText || node.textContent || '';
+                return isVisible(node)
+                    && text.includes('本页全选')
+                    && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(text);
+            });
+            const drawer = drawers.at(-1);
+            if (!drawer) return null;
+            const buttons = Array.from(drawer.querySelectorAll('button, [role="button"], .oc-button-wrap'))
+                .filter(node => {
+                    const disabled = node.disabled
+                        || node.getAttribute?.('aria-disabled') === 'true'
+                        || /disabled/i.test(node.className?.toString?.() || '');
+                    return isVisible(node) && clean(node) === '确定' && !disabled;
+                })
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (br.top - ar.top) || (br.left - ar.left);
+                });
+            const button = buttons[0];
+            if (!button) return null;
+            const rect = button.getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        }"""
+    )
+    if box:
+        await page.mouse.click(float(box["x"]), float(box["y"]))
+    else:
+        confirm = video_material_dialog(page).get_by_role("button", name="确定")
+        await expect(confirm.last).to_be_visible(timeout=5_000)
+        await expect(confirm.last).to_be_enabled(timeout=5_000)
+        await confirm.last.click()
+    await polite_pause(page, 800)
+    if await video_material_dialog_still_open(page):
+        box = await video_material_confirm_button_box(page)
+        if box:
+            await page.mouse.click(float(box["x"]), float(box["y"]))
+            await polite_pause(page, 800)
+
+
+async def video_material_confirm_button_box(page: Page) -> dict[str, float] | None:
+    return await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => {
+                const text = node.innerText || node.textContent || '';
+                return isVisible(node)
+                    && text.includes('本页全选')
+                    && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(text);
+            });
+            const drawer = drawers.at(-1);
+            if (!drawer) return null;
+            const buttons = Array.from(drawer.querySelectorAll('button, [role="button"], .oc-button-wrap'))
+                .filter(node => {
+                    const disabled = node.disabled
+                        || node.getAttribute?.('aria-disabled') === 'true'
+                        || /disabled/i.test(node.className?.toString?.() || '');
+                    return isVisible(node) && clean(node) === '确定' && !disabled;
+                })
+                .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (br.top - ar.top) || (br.left - ar.left);
+                });
+            const button = buttons[0];
+            if (!button) return null;
+            const rect = button.getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        }"""
+    )
+
+
+async def goto_next_video_page(page: Page) -> bool:
+    clicked = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const drawers = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+            const drawer = drawers.at(-1);
+            if (!drawer) return false;
+            const pages = Array.from(drawer.querySelectorAll('.ovui-page-turner__item, li, button'))
+                .filter(isVisible);
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const activeIndex = pages.findIndex(node => String(node.className).includes('active'));
+            let next = null;
+            if (activeIndex >= 0) {
+                next = pages.slice(activeIndex + 1).find(node => /^\\d+$/.test(clean(node)));
+            }
+            if (!next) {
+                next = pages.find(node => clean(node).includes('下一页') || String(node.className).includes('next'));
+            }
+            if (!next || String(next.className).includes('disabled')) return false;
+            next.click();
+            return true;
+        }"""
+    )
+    if clicked:
+        await polite_pause(page, 900)
+    return bool(clicked)
+
+
+async def wait_for_video_selection_applied(page: Page, count: int) -> None:
+    try:
+        await page.wait_for_function(
+            """count => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const text = document.body?.innerText || '';
+                const activeVideoDialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => {
+                    const dialogText = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && (
+                            dialogText.includes('本页全选')
+                            || dialogText.includes('添加引导视频')
+                            || (dialogText.includes('批量关联') && dialogText.includes('已关联'))
+                        );
+                });
+                if (activeVideoDialogs.length > 0) return false;
+                if (text.includes(`视频 (${count}个)`) || text.includes(`视频(${count}个)`)) return true;
+                if (/视频\\s*\\([1-9]\\d*个\\)/.test(text)) return true;
+
+                const hasCreateSubmit = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .filter(isVisible)
+                    .some(node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').includes('发布项目'));
+                const hasVideoPreview = Array.from(document.querySelectorAll('video, .oc-video-player, [data-auto-id="oc-video-player"]'))
+                    .some(isVisible);
+                const hasMaterialPreview = text.includes('素材预览');
+                return hasCreateSubmit && hasMaterialPreview && hasVideoPreview;
+            }""",
+            arg=count,
+            timeout=15_000,
+        )
+    except PlaywrightTimeoutError as exc:
+        if await video_material_dialog_still_open(page):
+            await confirm_video_material_selection(page)
+            try:
+                await page.wait_for_function(
+                    """count => {
+                        const isVisible = node => {
+                            const rect = node.getBoundingClientRect();
+                            const style = window.getComputedStyle(node);
+                            return rect.width > 0
+                                && rect.height > 0
+                                && rect.bottom > 0
+                                && rect.top < window.innerHeight
+                                && style.display !== 'none'
+                                && style.visibility !== 'hidden';
+                        };
+                        const activeVideoDialogs = Array.from(document.querySelectorAll(
+                            '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                        )).filter(node => {
+                            const dialogText = node.innerText || node.textContent || '';
+                            return isVisible(node)
+                                && dialogText.includes('本页全选')
+                                && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(dialogText);
+                        });
+                        if (activeVideoDialogs.length > 0) return false;
+                        const text = document.body?.innerText || '';
+                        return text.includes(`视频 (${count}个)`)
+                            || text.includes(`视频(${count}个)`)
+                            || /视频\\s*\\([1-9]\\d*个\\)/.test(text)
+                            || (text.includes('素材预览') && text.includes('发布项目'));
+                    }""",
+                    arg=count,
+                    timeout=8_000,
+                )
+                return
+            except PlaywrightTimeoutError:
+                pass
+        if await video_selection_already_applied(page):
+            return
+        raise exc
+
+
+async def video_material_dialog_still_open(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                return Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).some(node => {
+                    const text = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && text.includes('本页全选')
+                        && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(text);
+                });
+            }"""
+        )
+    )
+
+
+async def video_selection_already_applied(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const text = document.body?.innerText || '';
+                const activeVideoDialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => {
+                    const dialogText = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && (
+                            dialogText.includes('本页全选')
+                            || dialogText.includes('添加引导视频')
+                            || (dialogText.includes('批量关联') && dialogText.includes('已关联'))
+                        );
+                });
+                if (activeVideoDialogs.length > 0) return false;
+                const hasCreateSubmit = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .filter(isVisible)
+                    .some(node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').includes('发布项目'));
+                const hasVideoPreview = Array.from(document.querySelectorAll('video, .oc-video-player, [data-auto-id="oc-video-player"]'))
+                    .some(isVisible);
+                return hasCreateSubmit && text.includes('素材预览') && hasVideoPreview;
+            }"""
+        )
+    )
+
+
+async def handle_video_guide_branch_if_needed(page: Page) -> None:
+    if not await wait_for_video_guide_drawer(page, timeout=5_000):
+        return
+
+    for _ in range(3):
+        counts = await video_guide_associated_counts(page)
+        if counts and counts[0] >= counts[1] > 0:
+            await click_video_guide_confirm(page)
+            await wait_for_video_guide_closed(page)
+            return
+
+        selected = await click_video_guide_select_all_checkbox(page)
+        if not selected:
+            selected = await click_video_guide_first_checkbox(page)
+        if selected and not await video_guide_batch_button_enabled(page):
+            selected = await click_video_guide_visible_row_checkboxes(page) or selected
+        if not selected:
+            await polite_pause(page, 500)
+            continue
+
+        if not await click_video_guide_batch_button(page):
+            await polite_pause(page, 500)
+            continue
+
+        await polite_pause(page, 500)
+        await ensure_video_guide_modal_checkbox_checked(page)
+        await click_video_guide_confirm(page)
+        await polite_pause(page, 700)
+
+        if await wait_for_video_guide_drawer(page, timeout=1_000):
+            counts = await video_guide_associated_counts(page)
+            if counts and counts[0] >= counts[1] > 0:
+                await click_video_guide_confirm(page)
+                await wait_for_video_guide_closed(page)
+                return
+
+        if not await wait_for_video_guide_drawer(page, timeout=1_000):
+            return
+
+    if await wait_for_video_guide_drawer(page, timeout=500):
+        raise RuntimeError("添加引导视频分支未处理完成。")
+
+
+async def wait_for_video_guide_drawer(page: Page, timeout: int) -> bool:
+    try:
+        await page.wait_for_function(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                return Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).some(node => {
+                    const text = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && text.includes('批量关联')
+                        && (
+                            text.includes('添加引导视频')
+                            || text.includes('引导视频')
+                            || text.includes('已关联')
+                        );
+                });
+            }""",
+            timeout=timeout,
+        )
+        return True
+    except PlaywrightTimeoutError:
+        return False
+
+
+async def wait_for_video_guide_closed(page: Page) -> None:
+    await page.wait_for_function(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            return !Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).some(node => {
+                const text = node.innerText || node.textContent || '';
+                return isVisible(node)
+                    && text.includes('批量关联')
+                    && (
+                        text.includes('添加引导视频')
+                        || text.includes('引导视频')
+                        || text.includes('已关联')
+                    );
+            });
+        }""",
+        timeout=10_000,
+    )
+
+
+async def video_guide_associated_counts(page: Page) -> tuple[int, int] | None:
+    value = await page.evaluate(
+        """() => {
+            const text = document.body?.innerText || '';
+            const match = text.match(/已关联[：:]\\s*素材\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+            if (!match) return null;
+            return [Number(match[1]), Number(match[2])];
+        }"""
+    )
+    if not value:
+        return None
+    return int(value[0]), int(value[1])
+
+
+async def click_video_guide_select_all_checkbox(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => {
+                    const text = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && text.includes('批量关联')
+                        && (
+                            text.includes('添加引导视频')
+                            || text.includes('引导视频')
+                            || text.includes('已关联')
+                        );
+                });
+                const drawer = dialogs.at(-1);
+                if (!drawer) return false;
+                const drawerRect = drawer.getBoundingClientRect();
+                const nodes = Array.from(drawer.querySelectorAll(
+                    '.oc-checkbox.oc-checkbox--dark .ovui-checkbox__inner, .ovui-table-header .ovui-checkbox__inner, thead .ovui-checkbox__inner, .ovui-checkbox__inner, [role="checkbox"]'
+                )).filter(node => {
+                    const rect = node.getBoundingClientRect();
+                    const disabledOwner = node.closest('[aria-disabled="true"], .is-disabled, .ovui-checkbox--disabled, button[disabled]');
+                    return isVisible(node)
+                        && !disabledOwner
+                        && rect.left < drawerRect.left + 150
+                        && rect.top > drawerRect.top + 40
+                        && rect.bottom < drawerRect.bottom - 60;
+                });
+                if (!nodes.length) return false;
+                const node = nodes[0];
+                const checkbox = node.closest('[role="checkbox"], label, .ovui-checkbox, .oc-checkbox') || node;
+                const input = checkbox.querySelector?.('input[type="checkbox"]');
+                if (input?.checked || checkbox.getAttribute?.('aria-checked') === 'true') return true;
+                checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }"""
+        )
+    )
+
+
+async def click_video_guide_batch_button(page: Page) -> bool:
+    try:
+        await page.wait_for_function(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                return Array.from(document.querySelectorAll('button, [role="button"]')).some(node =>
+                    isVisible(node)
+                    && clean(node) === '批量关联'
+                    && !node.disabled
+                    && node.getAttribute('aria-disabled') !== 'true'
+                    && !/disabled/i.test(node.className?.toString?.() || '')
+                );
+            }""",
+            timeout=8_000,
+        )
+    except PlaywrightTimeoutError:
+        return False
+
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                const button = Array.from(document.querySelectorAll('button, [role="button"]')).find(node =>
+                    isVisible(node)
+                    && clean(node) === '批量关联'
+                    && !node.disabled
+                    && node.getAttribute('aria-disabled') !== 'true'
+                    && !/disabled/i.test(node.className?.toString?.() || '')
+                );
+                if (!button) return false;
+                button.click();
+                return true;
+            }"""
+        )
+    )
+
+
+async def video_guide_batch_button_enabled(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                return Array.from(document.querySelectorAll('button, [role="button"]')).some(node =>
+                    isVisible(node)
+                    && clean(node) === '批量关联'
+                    && !node.disabled
+                    && node.getAttribute('aria-disabled') !== 'true'
+                    && !/disabled/i.test(node.className?.toString?.() || '')
+                );
+            }"""
+        )
+    )
+
+
+async def click_video_guide_visible_row_checkboxes(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => {
+                    const text = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && text.includes('批量关联')
+                        && (
+                            text.includes('添加引导视频')
+                            || text.includes('引导视频')
+                            || text.includes('已关联')
+                        );
+                });
+                const drawer = dialogs.at(-1);
+                if (!drawer) return false;
+                const drawerRect = drawer.getBoundingClientRect();
+                const nodes = Array.from(drawer.querySelectorAll(
+                    'tbody .ovui-checkbox__inner, tr .ovui-checkbox__inner, .ovui-table-row .ovui-checkbox__inner, .oc-table-row .ovui-checkbox__inner, [role="checkbox"]'
+                )).filter(node => {
+                    const rect = node.getBoundingClientRect();
+                    const disabledOwner = node.closest('[aria-disabled="true"], .is-disabled, .ovui-checkbox--disabled, button[disabled]');
+                    return isVisible(node)
+                        && !disabledOwner
+                        && rect.left < drawerRect.left + 170
+                        && rect.top > drawerRect.top + 80
+                        && rect.bottom < drawerRect.bottom - 80;
+                });
+                let clicked = false;
+                for (const node of nodes.slice(0, 20)) {
+                    const checkbox = node.closest('[role="checkbox"], label, .ovui-checkbox, .oc-checkbox') || node;
+                    const input = checkbox.querySelector?.('input[type="checkbox"]');
+                    const checked = input?.checked
+                        || checkbox.getAttribute?.('aria-checked') === 'true'
+                        || (/checked/i.test(checkbox.className?.toString?.() || '') && !/unchecked/i.test(checkbox.className?.toString?.() || ''));
+                    if (checked) continue;
+                    checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    clicked = true;
+                }
+                return clicked;
+            }"""
+        )
+    )
+
+
+async def click_video_guide_first_checkbox(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const selectors = [
+                    '.oc-checkbox.oc-checkbox--dark .ovui-checkbox__inner',
+                    '.oc-checkbox--dark .ovui-checkbox__inner',
+                    '.ovui-checkbox__inner',
+                    '[role="checkbox"]'
+                ];
+                for (const selector of selectors) {
+                    const nodes = Array.from(document.querySelectorAll(selector)).filter(isVisible);
+                    const node = nodes.find(item => {
+                        const area = item.closest('tr, .oc-table-row, .ovui-table-row, .oc-card, div') || item;
+                        const text = area.innerText || area.textContent || '';
+                        return text.includes('视频') || text.includes('引导') || text.includes('批量关联');
+                    }) || nodes[0];
+                    if (!node) continue;
+                    const checkbox = node.closest('[role="checkbox"], label, .ovui-checkbox, .oc-checkbox') || node;
+                    const input = checkbox.querySelector?.('input[type="checkbox"]');
+                    if (input?.checked || checkbox.getAttribute?.('aria-checked') === 'true') return true;
+                    checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                    checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                    checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                    return true;
+                }
+                return false;
+            }"""
+        )
+    )
+
+
+async def ensure_video_guide_modal_checkbox_checked(page: Page) -> None:
+    checked = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const dialogs = Array.from(document.querySelectorAll(
+                '.ovui-modal, .byted-modal, .ovui-drawer__wrap, .ovui-drawer, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node));
+            const dialog = dialogs.reverse().find(node => {
+                const text = node.innerText || node.textContent || '';
+                return text.includes('确定') && (text.includes('批量关联') || text.includes('引导视频') || text.includes('视频'));
+            });
+            if (!dialog) return false;
+            const nodes = Array.from(dialog.querySelectorAll('.ovui-checkbox__inner, [role="checkbox"], label'))
+                .filter(isVisible);
+            const node = nodes.find(item => {
+                const area = item.closest('label, [role="checkbox"], .ovui-checkbox, .oc-checkbox') || item;
+                const input = area.querySelector?.('input[type="checkbox"]');
+                return !input || !input.disabled;
+            });
+            if (!node) return false;
+            const checkbox = node.closest('[role="checkbox"], label, .ovui-checkbox, .oc-checkbox') || node;
+            const input = checkbox.querySelector?.('input[type="checkbox"]');
+            if (input?.checked || checkbox.getAttribute?.('aria-checked') === 'true') return true;
+            checkbox.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            checkbox.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            return true;
+        }"""
+    )
+    if not checked:
+        checkbox = page.locator(".ovui-checkbox.ovui-checkbox--lg .ovui-checkbox__inner").last
+        await expect(checkbox).to_be_visible(timeout=5_000)
+        await checkbox.click()
+    await polite_pause(page, 300)
+
+
+async def click_video_guide_confirm(page: Page) -> None:
+    clicked = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+                .filter(node => isVisible(node) && clean(node) === '确定' && !node.disabled);
+            const button = buttons.at(-1);
+            if (!button) return false;
+            button.click();
+            return true;
+        }"""
+    )
+    if clicked:
+        return
+    confirm = page.get_by_role("button", name="确定")
+    await expect(confirm.last).to_be_visible(timeout=5_000)
+    await expect(confirm.last).to_be_enabled(timeout=5_000)
+    await confirm.last.click()
 
 
 async def submit_ad_project(page: Page) -> None:
-    await scroll_text_into_view(page, "项目名称")
-    submit = page.get_by_role("button", name="发布项目")
-    await expect(submit.first).to_be_visible(timeout=8_000)
-    await expect(submit.first).to_be_enabled(timeout=15_000)
-    await click_first_visible(submit, "发布项目")
+    before_url = page.url
+    await scroll_to_submit_area(page)
+    if not await click_submit_project_button(page):
+        submit = page.get_by_role("button", name="发布项目")
+        await expect(submit.last).to_be_visible(timeout=8_000)
+        await expect(submit.last).to_be_enabled(timeout=15_000)
+        await submit.last.click(timeout=5_000)
     await polite_pause(page, 800)
     await confirm_submit_project_if_prompted(page)
+    await wait_for_submit_project_result(page, before_url)
 
 
 async def confirm_submit_project_if_prompted(page: Page) -> None:
-    confirm_selectors = (
-        ("button", "确认发布"),
-        ("button", "确定发布"),
-        ("button", "确认"),
-        ("button", "确定"),
-    )
-    for role, name in confirm_selectors:
-        locator = page.get_by_role(role, name=name)
-        for index in range(await locator.count()):
-            candidate = locator.nth(index)
+    for _ in range(3):
+        await ensure_submit_prompt_checkbox_checked(page)
+        clicked = await click_submit_confirm_button(page)
+        if not clicked:
+            return
+        await polite_pause(page, 800)
+
+
+async def scroll_to_submit_area(page: Page) -> None:
+    try:
+        await scroll_text_into_view(page, "项目名称")
+    except Exception:
+        await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        await polite_pause(page, 500)
+    await page.evaluate("() => window.scrollBy(0, 560)")
+    await polite_pause(page, 300)
+
+
+async def click_submit_project_button(page: Page) -> bool:
+    labels = [
+        "发布项目",
+        "提交项目",
+        "提交审核",
+        "保存并发布",
+        "保存并提交",
+    ]
+    for label in labels:
+        buttons = page.get_by_role("button", name=label, exact=True)
+        count = await buttons.count()
+        for index in range(count - 1, -1, -1):
+            button = buttons.nth(index)
             try:
-                if await candidate.is_visible(timeout=500) and await candidate.is_enabled(timeout=500):
-                    await candidate.click(timeout=2_000)
-                    await polite_pause(page, 800)
-                    return
-            except PlaywrightTimeoutError:
+                if not await button.is_visible(timeout=300):
+                    continue
+                await expect(button).to_be_enabled(timeout=2_000)
+                await button.scroll_into_view_if_needed(timeout=2_000)
+                try:
+                    await button.click(timeout=3_000)
+                except PlaywrightTimeoutError:
+                    box = await button.evaluate(
+                        """node => {
+                            const rect = node.getBoundingClientRect();
+                            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                        }"""
+                    )
+                    await page.mouse.click(float(box["x"]), float(box["y"]))
+                return True
+            except (PlaywrightError, PlaywrightTimeoutError):
                 continue
+
+    box = await page.evaluate(
+        """() => {
+                const labels = [
+                    '发布项目',
+                    '提交项目',
+                    '提交审核',
+                    '保存并发布',
+                    '保存并提交',
+                ];
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                const disabled = node => Boolean(
+                    node.disabled
+                    || node.getAttribute?.('aria-disabled') === 'true'
+                    || /disabled/.test(node.className || '')
+                );
+                const candidates = Array.from(document.querySelectorAll('button, [role="button"], .oc-button-wrap'))
+                    .filter(node => isVisible(node) && !disabled(node));
+                const button = candidates
+                    .filter(node => labels.includes(clean(node)))
+                    .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+                if (!button) return null;
+                button.scrollIntoView({ block: 'center', inline: 'nearest' });
+                const rect = button.getBoundingClientRect();
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            }"""
+    )
+    if not box:
+        return False
+    await polite_pause(page, 150)
+    await page.mouse.click(float(box["x"]), float(box["y"]))
+    return True
+
+
+async def ensure_submit_prompt_checkbox_checked(page: Page) -> None:
+    await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const dialogs = Array.from(document.querySelectorAll('.ovui-modal, .byted-modal, [role="dialog"]'))
+                .filter(isVisible);
+            const dialog = dialogs.at(-1);
+            if (!dialog) return false;
+            const checkboxes = Array.from(dialog.querySelectorAll(
+                'input[type="checkbox"], [role="checkbox"], .ovui-checkbox, .oc-checkbox, .byted-checkbox'
+            )).filter(isVisible);
+            for (const checkbox of checkboxes) {
+                const area = checkbox.closest('label, [role="checkbox"], .ovui-checkbox, .oc-checkbox, .byted-checkbox')
+                    || checkbox;
+                const input = area.querySelector?.('input[type="checkbox"]') || checkbox;
+                const checked = input.checked
+                    || area.getAttribute?.('aria-checked') === 'true'
+                    || /checked/.test(area.className || '');
+                if (checked || input.disabled) continue;
+                area.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                area.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                area.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+            return true;
+        }"""
+    )
+
+
+async def click_submit_confirm_button(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const labels = [
+                    '确认发布',
+                    '确定发布',
+                    '确认提交',
+                    '确定提交',
+                    '提交审核',
+                    '继续发布',
+                    '继续提交',
+                    '确认',
+                    '确定',
+                    '我知道了',
+                ];
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                const disabled = node => Boolean(
+                    node.disabled
+                    || node.getAttribute?.('aria-disabled') === 'true'
+                    || /disabled/.test(node.className || '')
+                );
+                const dialogs = Array.from(document.querySelectorAll('.ovui-modal, .byted-modal, [role="dialog"]'))
+                    .filter(isVisible);
+                const scope = dialogs.at(-1);
+                if (!scope) return false;
+                const buttons = Array.from(scope.querySelectorAll('button, [role="button"], .oc-button-wrap'))
+                    .filter(node => isVisible(node) && !disabled(node));
+                const button = buttons.find(node => labels.includes(clean(node)))
+                    || buttons.find(node => labels.some(label => clean(node).includes(label)));
+                if (!button) return false;
+                button.scrollIntoView({ block: 'center', inline: 'nearest' });
+                for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                    button.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                }
+                return true;
+            }"""
+        )
+    )
+
+
+async def raise_submit_validation_error_if_any(page: Page) -> None:
+    await polite_pause(page, 1200)
+    message = await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const selectors = [
+                '.ovui-message',
+                '.ovui-toast',
+                '.byted-toast',
+                '.byted-message',
+                '.oc-message',
+                '[role="alert"]',
+                '.error',
+                '[class*="error"]',
+            ];
+            const nodes = selectors.flatMap(selector => Array.from(document.querySelectorAll(selector)));
+            const text = nodes
+                .filter(isVisible)
+                .map(node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim())
+                .find(value => /失败|错误|必填|请填写|请选择|未填写|不能为空|校验|不符合|异常/.test(value));
+            return text || '';
+        }"""
+    )
+    if message:
+        raise RuntimeError(f"提交失败，页面提示：{message}")
+
+
+async def wait_for_submit_project_result(page: Page, before_url: str) -> None:
+    await raise_submit_validation_error_if_any(page)
+    try:
+        await page.wait_for_function(
+            """beforeUrl => {
+                const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+                const successPattern = /提交成功|发布成功|创建成功|已提交|已发布|审核中|项目创建成功|广告创建成功/;
+                if (successPattern.test(bodyText)) return true;
+                const currentUrl = location.href;
+                if (currentUrl !== beforeUrl && !currentUrl.includes('/ad/create')) return true;
+                return false;
+            }""",
+            arg=before_url,
+            timeout=20_000,
+        )
+        return
+    except PlaywrightTimeoutError:
+        pass
+    await raise_submit_validation_error_if_any(page)
+    raise RuntimeError("提交项目后未检测到成功提示或页面跳转，已停止批量运行以避免误标记账户完成。")
 
 
 def product_image_upload_drawer(page: Page) -> Locator:
@@ -2672,10 +4406,27 @@ async def click_product_upload_area(page: Page) -> None:
             const drawer = drawers.at(-1);
             if (!drawer) return null;
             const uploadText = Array.from(drawer.querySelectorAll('span,div,button,label'))
-                .find(node => isVisible(node) && clean(node) === '点击上传');
-            if (!uploadText) return null;
-            const clickable = uploadText.closest('button,label,[role="button"],[data-auto-id="create-upload-select"],.oc-create-upload-select-wrapper')
-                || uploadText;
+                .find(node => isVisible(node) && clean(node).includes('点击上传'));
+            if (uploadText) {
+                const clickable = uploadText.closest('button,label,[role="button"],[data-auto-id="create-upload-select"],.oc-create-upload-select-wrapper,[class*="upload"]')
+                    || uploadText;
+                const rect = clickable.getBoundingClientRect();
+                return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+            }
+            const candidates = Array.from(drawer.querySelectorAll('div,label,button'))
+                .filter(isVisible)
+                .map(node => ({ node, rect: node.getBoundingClientRect(), text: clean(node), cls: node.className?.toString?.() || '' }))
+                .filter(item => {
+                    const dashed = (window.getComputedStyle(item.node).borderStyle || '').includes('dashed');
+                    return item.rect.width >= 280
+                        && item.rect.height >= 80
+                        && (dashed || /upload/i.test(item.cls) || item.text.includes('拖拽') || item.text.includes('文件'));
+                })
+                .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+            const target = candidates[0]?.node || null;
+            if (!target) return null;
+            const clickable = target.closest('button,label,[role="button"],[class*="upload"]')
+                || target;
             const rect = clickable.getBoundingClientRect();
             return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
         }"""
@@ -2683,6 +4434,88 @@ async def click_product_upload_area(page: Page) -> None:
     if not box:
         raise RuntimeError("找不到产品主图点击上传入口")
     await page.mouse.click(box["x"], box["y"])
+
+
+async def dispatch_product_image_drop(page: Page, image_path: Path) -> bool:
+    data_url = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    mime_type = mimetypes.guess_type(str(image_path))[0] or "image/png"
+    dropped = await page.evaluate(
+        """async ({ filename, mimeType, dataUrl }) => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const dialogs = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && clean(node).includes('本地上传'));
+            const dialog = dialogs.at(-1);
+            if (!dialog) return false;
+            const target = dialog.querySelector('[data-auto-id="create-upload-select"]')
+                || Array.from(dialog.querySelectorAll('div,label,button'))
+                    .filter(isVisible)
+                    .find(node => clean(node).includes('点击上传') || clean(node).includes('拖拽到此处'));
+            if (!target) return false;
+            target.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const binary = atob(dataUrl);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index += 1) {
+                bytes[index] = binary.charCodeAt(index);
+            }
+            const file = new File([bytes], filename, { type: mimeType });
+            const dataTransfer = new DataTransfer();
+            dataTransfer.items.add(file);
+            for (const type of ['dragenter', 'dragover', 'drop']) {
+                const event = new DragEvent(type, {
+                    bubbles: true,
+                    cancelable: true,
+                    dataTransfer,
+                });
+                target.dispatchEvent(event);
+            }
+            return true;
+        }""",
+        {
+            "filename": image_path.name,
+            "mimeType": mime_type,
+            "dataUrl": data_url,
+        },
+    )
+    if dropped:
+        await polite_pause(page, 1000)
+    return bool(dropped)
+
+
+async def wait_for_product_upload_surface(page: Page) -> None:
+    await page.wait_for_function(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const dialogs = Array.from(document.querySelectorAll(
+                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+            )).filter(node => isVisible(node) && clean(node).includes('本地上传'));
+            const dialog = dialogs.at(-1);
+            if (!dialog) return false;
+            if (dialog.querySelector('input[type="file"]')) return true;
+            return clean(dialog).includes('点击上传') || clean(dialog).includes('拖拽到此处');
+        }""",
+        timeout=10_000,
+    )
 
 
 async def wait_for_product_image_uploaded(page: Page, filename: str) -> None:

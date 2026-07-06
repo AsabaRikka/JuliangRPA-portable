@@ -194,7 +194,14 @@ async def first_page(context: BrowserContext) -> Page:
 
 
 async def fresh_page(context: BrowserContext) -> Page:
-    page = await context.new_page()
+    window_state = await current_browser_window_state(context)
+    if window_state == "minimized":
+        page = next((candidate for candidate in context.pages if not candidate.is_closed()), None)
+        if page is None:
+            page = await context.new_page()
+            await set_browser_window_state(page, "minimized")
+    else:
+        page = await context.new_page()
     for old_page in list(context.pages):
         if old_page == page:
             continue
@@ -251,7 +258,6 @@ async def _launch_persistent_context(
         "--force-device-scale-factor=1",
         "--high-dpi-support=1",
         "--window-size=1920,1080",
-        "--start-maximized",
     ]
 
     base_kwargs = {
@@ -309,6 +315,34 @@ def configure_playwright_browsers_path() -> None:
 def should_record_video() -> bool:
     requested = os.getenv("JULIANG_RECORD_VIDEO", "").strip().lower() in {"1", "true", "yes", "y", "on"}
     return requested and playwright_ffmpeg_available()
+
+
+async def current_browser_window_state(context: BrowserContext) -> str | None:
+    page = next((candidate for candidate in context.pages if not candidate.is_closed()), None)
+    if page is None:
+        return None
+    try:
+        session = await context.new_cdp_session(page)
+        result = await session.send("Browser.getWindowForTarget")
+        bounds = result.get("bounds", {})
+        return bounds.get("windowState")
+    except Exception:
+        return None
+
+
+async def set_browser_window_state(page: Page, window_state: str) -> None:
+    try:
+        session = await page.context.new_cdp_session(page)
+        result = await session.send("Browser.getWindowForTarget")
+        await session.send(
+            "Browser.setWindowBounds",
+            {
+                "windowId": result["windowId"],
+                "bounds": {"windowState": window_state},
+            },
+        )
+    except Exception:
+        pass
 
 
 def playwright_ffmpeg_available() -> bool:
