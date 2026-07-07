@@ -1,0 +1,5 @@
+interface:
+  display_name: "Juliang Playwright RPA"
+  short_description: "Harden Playwright RPA ad flows"
+  default_prompt: "Use $juliang-playwright-rpa to design, debug, stabilize, or package a Python Playwright RPA flow."
+
