@@ -6,6 +6,7 @@ from datetime import datetime
 import base64
 import mimetypes
 from pathlib import Path
+import re
 import time
 from typing import Callable
 from playwright.async_api import (
@@ -66,10 +67,13 @@ class NewAdOptions:
     product_image_path: str = r"C:\Users\tanyu\Desktop\icon108\我的保安人生.jpeg"
     auto_add_videos: bool = False
     auto_add_video_count: str = "40"
+    auto_add_video_pages: str = "1"
     specific_video_count: str = ""
     change_douyin_nickname: bool = False
     douyin_nickname: str = ""
     submit_project: bool = False
+    submit_retry_count: str = "0"
+    submit_retry_interval_seconds: str = "5"
     ensure_event_asset: bool = True
     dry_run: bool = False
 
@@ -99,6 +103,8 @@ async def run_new_ad(
 
         async with step(progress, "检查登录态"):
             await ensure_logged_in(page)
+        async with step(progress, "确认营销目的为小程序"):
+            await ensure_mini_program_marketing_goal(page)
         async with step(progress, "选择字节小游戏"):
             await choose_byte_mini_game(page, options)
 
@@ -112,6 +118,8 @@ async def run_new_ad(
                 await ensure_event_asset_and_events(page.context, page, settings, options, progress)
             async with step(progress, "返回新建广告页"):
                 await goto_create_page(page, create_ad_url)
+            async with step(progress, "确认营销目的为小程序"):
+                await ensure_mini_program_marketing_goal(page)
             async with step(progress, "重新选择字节小游戏"):
                 await choose_byte_mini_game(page, options)
             async with step(progress, "选择优化目标与深度优化目标"):
@@ -139,7 +147,7 @@ async def run_new_ad(
             await fill_product_card(page, options)
 
         async with step(progress, "填写项目名称"):
-            await fill_project_name(page, options)
+            project_name = await fill_project_name(page, options)
 
         if options.product_image_path.strip():
             async with step(progress, "上传产品主图"):
@@ -164,7 +172,13 @@ async def run_new_ad(
             )
         if options.submit_project:
             async with step(progress, "提交项目"):
-                await submit_ad_project(page)
+                await submit_ad_project(
+                    page,
+                    project_name,
+                    normalize_submit_retry_count(options.submit_retry_count),
+                    normalize_submit_retry_interval_seconds(options.submit_retry_interval_seconds),
+                    progress,
+                )
         print(f"create ad URL: {create_ad_url}")
         print(f"Configured mini game: {options.mini_game_name}")
         print(f"Configured optimization: {options.optimization_goal} / {options.deep_optimization_goal}")
@@ -243,6 +257,144 @@ async def choose_byte_mini_game(page: Page, options: NewAdOptions) -> None:
     await expect(page.get_by_text(options.mini_game_name, exact=True).first).to_be_visible()
     await confirm_pending_modal(page)
     await polite_pause(page, 150)
+
+
+async def ensure_mini_program_marketing_goal(page: Page) -> None:
+    await scroll_text_into_view(page, "营销目的")
+    await polite_pause(page, 200)
+    if await mini_program_marketing_goal_is_selected(page) or await mini_program_product_flow_is_ready(page):
+        return
+
+    clicked = await click_mini_program_marketing_goal_card(page)
+    if not clicked:
+        await click_first_visible(
+            page.locator("div").filter(has_text=re.compile(r"^小程序$")),
+            "营销目的小程序",
+        )
+    await polite_pause(page, 400)
+    await confirm_marketing_goal_switch_if_prompted(page)
+    await wait_for_mini_program_marketing_goal_selected(page)
+
+
+async def mini_program_marketing_goal_is_selected(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const area = node => {
+                    const rect = node.getBoundingClientRect();
+                    return rect.width * rect.height;
+                };
+                const cards = Array.from(document.querySelectorAll('.oc-switch-card-item, [data-e2e*="ocSwitchCard"]'))
+                    .filter(node => clean(node).includes('小程序'))
+                    .filter(node => area(node) > 0)
+                    .sort((left, right) => area(left) - area(right));
+                const card = cards[0];
+                if (!card) return false;
+                const className = card.getAttribute('class') || '';
+                if (/active|checked|selected/.test(className)) return true;
+                return Boolean(card.querySelector('.oc-checkbox--checked, .ovui-checkbox--checked, [aria-checked="true"]'));
+            }"""
+        )
+    )
+
+
+async def mini_program_product_flow_is_ready(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const text = (document.body?.innerText || document.body?.textContent || '').replace(/\\s+/g, ' ');
+                if (!text.includes('投放产品与载体')) return false;
+                if (text.includes('选择小游戏') || text.includes('重新选择')) return true;
+                return text.includes('微信小游戏') && text.includes('字节小游戏');
+            }"""
+        )
+    )
+
+
+async def click_mini_program_marketing_goal_card(page: Page) -> bool:
+    cards = page.locator(".oc-switch-card-item").filter(has_text="小程序")
+    try:
+        count = await cards.count()
+    except PlaywrightError:
+        count = 0
+    if count <= 0:
+        cards = page.locator("[data-e2e*='ocSwitchCard']").filter(has_text="小程序")
+        try:
+            count = await cards.count()
+        except PlaywrightError:
+            count = 0
+
+    for index in range(count):
+        card = cards.nth(index)
+        try:
+            if not await card.is_visible(timeout=500):
+                continue
+            await card.scroll_into_view_if_needed(timeout=2_000)
+            await card.click(timeout=2_000, force=True)
+            return True
+        except PlaywrightError:
+            box = await card.bounding_box()
+            if not box:
+                continue
+            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            return True
+    return False
+
+
+async def confirm_marketing_goal_switch_if_prompted(page: Page) -> None:
+    modal = page.locator(".ovui-modal, .byted-modal, [role='dialog']").filter(
+        has_text=re.compile("切换营销目的|是否继续切换|清空已填写"),
+        visible=True,
+    )
+    if await modal.count() == 0:
+        await confirm_pending_modal(page)
+        return
+    for button_name in ("确认", "确定", "继续切换", "继续"):
+        button = modal.first.get_by_role("button", name=button_name)
+        if await button.count() >= 1:
+            await button.first.click()
+            await polite_pause(page, 700)
+            return
+
+
+async def wait_for_mini_program_marketing_goal_selected(page: Page) -> None:
+    try:
+        await page.wait_for_function(
+            """() => {
+                const bodyText = (document.body?.innerText || document.body?.textContent || '').replace(/\\s+/g, ' ');
+                if (
+                    bodyText.includes('投放产品与载体')
+                    && (
+                        bodyText.includes('选择小游戏')
+                        || bodyText.includes('重新选择')
+                        || (bodyText.includes('微信小游戏') && bodyText.includes('字节小游戏'))
+                    )
+                ) {
+                    return true;
+                }
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const area = node => {
+                    const rect = node.getBoundingClientRect();
+                    return rect.width * rect.height;
+                };
+                const cards = Array.from(document.querySelectorAll('.oc-switch-card-item, [data-e2e*="ocSwitchCard"]'))
+                    .filter(node => clean(node).includes('小程序'))
+                    .filter(node => area(node) > 0)
+                    .sort((left, right) => area(left) - area(right));
+                const card = cards[0];
+                if (!card) return false;
+                const className = card.getAttribute('class') || '';
+                if (/active|checked|selected/.test(className)) return true;
+                return Boolean(card.querySelector('.oc-checkbox--checked, .ovui-checkbox--checked, [aria-checked="true"]'));
+            }""",
+            timeout=12_000,
+        )
+    except PlaywrightTimeoutError as exc:
+        if await mini_program_marketing_goal_is_selected(page) or await mini_program_product_flow_is_ready(page):
+            return
+        raise RuntimeError("切换营销目的为小程序失败。") from exc
+    await polite_pause(page, 500)
 
 
 async def optimization_goal_is_empty(page: Page) -> bool:
@@ -1885,25 +2037,201 @@ async def select_unlimited_targeting(page: Page) -> None:
 
 async def enable_aigc_dynamic_creative(page: Page) -> None:
     await scroll_text_into_view(page, "AIGC动态创意")
-    checked = await page.evaluate(
+    for _ in range(3):
+        state = await aigc_dynamic_creative_state(page)
+        if state.get("enabled"):
+            await polite_pause(page, 250)
+            return
+        if not state.get("found"):
+            await scroll_text_into_view(page, "AIGC动态创意")
+            await polite_pause(page, 300)
+            continue
+
+        if await click_aigc_dynamic_creative_by_locator(page):
+            await polite_pause(page, 350)
+            if await aigc_dynamic_creative_is_enabled(page):
+                await polite_pause(page, 250)
+                return
+
+        for x_key, y_key in (
+            ("checkboxX", "checkboxY"),
+            ("cornerX", "cornerY"),
+            ("centerX", "centerY"),
+        ):
+            x_value = state.get(x_key)
+            y_value = state.get(y_key)
+            if x_value is None or y_value is None:
+                continue
+            await page.mouse.click(float(x_value), float(y_value))
+            await polite_pause(page, 350)
+            if await aigc_dynamic_creative_is_enabled(page):
+                await polite_pause(page, 250)
+                return
+
+        await click_aigc_dynamic_creative_by_dom(page)
+        await polite_pause(page, 350)
+        if await aigc_dynamic_creative_is_enabled(page):
+            await polite_pause(page, 250)
+            return
+
+    raise RuntimeError("Cannot find AIGC动态创意 checkbox.")
+
+
+async def click_aigc_dynamic_creative_by_locator(page: Page) -> bool:
+    cards = page.locator(".oc-switch-card-item").filter(has_text="AIGC动态创意")
+    try:
+        count = await cards.count()
+    except PlaywrightError:
+        count = 0
+    if count <= 0:
+        cards = page.locator("[data-e2e*='ocSwitchCard']").filter(has_text="AIGC动态创意")
+        try:
+            count = await cards.count()
+        except PlaywrightError:
+            count = 0
+
+    for index in range(count):
+        card = cards.nth(index)
+        try:
+            if not await card.is_visible(timeout=500):
+                continue
+            await card.scroll_into_view_if_needed(timeout=2_000)
+        except PlaywrightError:
+            continue
+
+        click_targets = (
+            card.locator("label.ovui-checkbox").first,
+            card.locator(".oc-checkbox").first,
+            card.locator(".ovui-checkbox").first,
+            card.locator("[role='checkbox']").first,
+        )
+        for target in click_targets:
+            try:
+                if await target.count() <= 0:
+                    continue
+                await target.click(timeout=1_500, force=True)
+                return True
+            except PlaywrightError:
+                continue
+
+        box = await card.bounding_box()
+        if not box:
+            continue
+        for x, y in (
+            (box["width"] - 16, 18),
+            (box["width"] - 16, box["height"] / 2),
+            (box["width"] / 2, box["height"] / 2),
+        ):
+            try:
+                await card.click(position={"x": x, "y": y}, timeout=1_500, force=True)
+                return True
+            except PlaywrightError:
+                continue
+    return False
+
+
+async def aigc_dynamic_creative_state(page: Page) -> dict[str, object]:
+    return await page.evaluate(
         """() => {
-            const cards = Array.from(document.querySelectorAll('label,div,section'));
-            const card = cards.find(node => {
-                const text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const bodyText = document.body?.innerText || document.body?.textContent || '';
+            if (bodyText.includes('AIGC动态创意素材已开启')) {
+                return { found: true, enabled: true };
+            }
+            const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const area = node => {
                 const rect = node.getBoundingClientRect();
-                return text.includes('AIGC动态创意') && rect.width > 120 && rect.height > 40;
+                return rect.width * rect.height;
+            };
+            const point = (x, y) => ({
+                x: Math.max(1, Math.min(window.innerWidth - 1, x)),
+                y: Math.max(1, Math.min(window.innerHeight - 1, y)),
             });
-            if (!card) return false;
+            const findAigcCard = () => {
+                const cards = Array.from(document.querySelectorAll('.oc-switch-card-item, [data-e2e*="ocSwitchCard"]'))
+                    .filter(node => clean(node).includes('AIGC动态创意'))
+                    .filter(node => area(node) > 0)
+                    .sort((left, right) => area(left) - area(right));
+                if (cards.length > 0) return cards[0];
+
+                const titleNodes = Array.from(document.querySelectorAll('label,div,span,p,strong'))
+                    .filter(node => clean(node).includes('AIGC动态创意'))
+                    .sort((left, right) => area(left) - area(right));
+                for (const titleNode of titleNodes) {
+                    const closest = titleNode.closest('.oc-switch-card-item, [data-e2e*="ocSwitchCard"]');
+                    if (closest && area(closest) > 0) return closest;
+                    let node = titleNode;
+                    for (let depth = 0; node && depth < 8; depth += 1, node = node.parentElement) {
+                        const text = clean(node);
+                        if (!text.includes('AIGC动态创意')) continue;
+                        const rect = node.getBoundingClientRect();
+                        if (rect.width >= 80 && rect.width <= 360 && rect.height >= 30 && rect.height <= 180) {
+                            return node;
+                        }
+                    }
+                }
+                return null;
+            };
+            const card = findAigcCard();
+            if (!card) return { found: false, enabled: false };
+            card.scrollIntoView({ block: 'center', inline: 'nearest' });
+            const rect = card.getBoundingClientRect();
             const input = card.querySelector('input[type="checkbox"]');
-            if (input && input.checked) return true;
-            const checkbox = card.querySelector('.ovui-checkbox, .byted-checkbox, [role="checkbox"]') || card;
-            checkbox.click();
-            return true;
+            const className = card.getAttribute('class') || '';
+            const enabled = Boolean(input?.checked)
+                || /active|checked|selected/.test(className)
+                || Boolean(card.querySelector('.oc-checkbox--checked, .ovui-checkbox--checked, .byted-checkbox-checked, [aria-checked="true"]'));
+            const checkbox = Array.from(card.querySelectorAll('.oc-checkbox, .ovui-checkbox, .byted-checkbox, [role="checkbox"], input[type="checkbox"]'))
+                .filter(node => area(node) > 0)
+                .sort((left, right) => area(left) - area(right))[0];
+            const checkboxRect = checkbox?.getBoundingClientRect();
+            const checkboxPoint = checkboxRect
+                ? point(checkboxRect.left + checkboxRect.width / 2, checkboxRect.top + checkboxRect.height / 2)
+                : point(rect.right - 22, rect.top + Math.min(28, rect.height / 2));
+            const cornerPoint = point(rect.right - 22, rect.top + Math.min(28, rect.height / 2));
+            const centerPoint = point(rect.left + rect.width / 2, rect.top + rect.height / 2);
+            return {
+                found: true,
+                enabled,
+                checkboxX: checkboxPoint.x,
+                checkboxY: checkboxPoint.y,
+                cornerX: cornerPoint.x,
+                cornerY: cornerPoint.y,
+                centerX: centerPoint.x,
+                centerY: centerPoint.y,
+            };
         }"""
     )
-    if not checked:
-        raise RuntimeError("Cannot find AIGC动态创意 checkbox.")
-    await polite_pause(page, 250)
+
+
+async def click_aigc_dynamic_creative_by_dom(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+                const area = node => {
+                    const rect = node.getBoundingClientRect();
+                    return rect.width * rect.height;
+                };
+                const cards = Array.from(document.querySelectorAll('.oc-switch-card-item, [data-e2e*="ocSwitchCard"], label,div,section'))
+                    .filter(node => clean(node).includes('AIGC动态创意'))
+                    .filter(node => area(node) > 0)
+                    .sort((left, right) => area(left) - area(right));
+                const card = cards[0];
+                if (!card) return false;
+                const target = card.querySelector('.oc-checkbox, .ovui-checkbox, .byted-checkbox, [role="checkbox"], input[type="checkbox"]') || card;
+                const clickable = target.closest('label, [role="checkbox"], .oc-checkbox, .ovui-checkbox, .byted-checkbox') || target;
+                clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                clickable.click?.();
+                return true;
+            }"""
+        )
+    )
+
+
+async def aigc_dynamic_creative_is_enabled(page: Page) -> bool:
+    return bool((await aigc_dynamic_creative_state(page)).get("enabled"))
 
 
 async def batch_add_ad_texts(page: Page, options: NewAdOptions) -> None:
@@ -1976,7 +2304,7 @@ async def fill_product_card(page: Page, options: NewAdOptions) -> None:
     await polite_pause(page, 250)
 
 
-async def fill_project_name(page: Page, options: NewAdOptions) -> None:
+async def fill_project_name(page: Page, options: NewAdOptions) -> str:
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H:%M:%S")
     project_name = f"{options.project_name_prefix}{timestamp}"
     await scroll_text_into_view(page, "项目名称")
@@ -1984,6 +2312,7 @@ async def fill_project_name(page: Page, options: NewAdOptions) -> None:
     await expect(field).to_be_visible()
     await fill_text_control(field, project_name)
     await polite_pause(page, 250)
+    return project_name
 
 
 async def fill_custom_douyin_nickname(page: Page, options: NewAdOptions) -> None:
@@ -2558,16 +2887,48 @@ async def auto_add_videos(page: Page, options: NewAdOptions) -> None:
         return
 
     count = normalize_video_page_size(options.auto_add_video_count)
+    page_count = normalize_video_page_count(options.auto_add_video_pages)
     await click_add_video_button(page)
 
     video_dialog = video_material_dialog(page)
     await expect(video_dialog).to_be_visible(timeout=10_000)
-    actual_count = await set_video_page_size(page, count)
-    await select_current_video_page(page)
+    actual_page_size = await set_video_page_size(page, count)
+    if not actual_page_size:
+        actual_page_size = count
+    selected_count = await select_video_pages(page, actual_page_size, page_count)
     await confirm_video_material_selection(page)
     await handle_video_guide_branch_if_needed(page)
-    await wait_for_video_selection_applied(page, actual_count)
+    await wait_for_video_selection_applied(page, selected_count)
     await polite_pause(page, 300)
+
+
+async def select_video_pages(page: Page, page_size: int, page_count: int) -> int:
+    total_count = await current_video_total_count(page)
+    selection_limit = await current_video_selection_limit(page)
+    selected_count = await current_video_selected_count(page)
+
+    for page_index in range(page_count):
+        await wait_for_video_cards_loaded(page)
+        selected_before = await current_video_selected_count(page)
+        await select_current_video_page(page)
+
+        expected_count = selected_before + page_size
+        if total_count:
+            expected_count = min(expected_count, total_count)
+        if selection_limit:
+            expected_count = min(expected_count, selection_limit)
+        selected_count = await wait_for_video_selected_progress(page, expected_count, timeout=10_000)
+
+        if page_index >= page_count - 1:
+            break
+        if selection_limit and selected_count >= selection_limit:
+            break
+        if total_count and selected_count >= total_count:
+            break
+        if not await goto_next_video_page(page):
+            break
+
+    return await current_video_selected_count(page)
 
 
 async def auto_add_specific_video_count(page: Page, requested_count: int) -> None:
@@ -2603,7 +2964,7 @@ async def auto_add_specific_video_count(page: Page, requested_count: int) -> Non
             expected_count = min(target_count, selected_count + page_size)
             selected_count = await wait_for_video_selected_progress(page, expected_count, timeout=10_000)
         else:
-            selected_count = await select_video_cards_within_current_page_until(
+            selected_count = await select_video_cards_with_recovery_until(
                 page,
                 target_count,
             )
@@ -2653,6 +3014,20 @@ def normalize_video_page_size(value: str) -> int:
         raise RuntimeError(f"自动添加视频数量无效：{value}") from exc
     if count not in {40, 80, 120, 160}:
         raise RuntimeError("自动添加视频数量只能是 40、80、120、160。")
+    return count
+
+
+def normalize_video_page_count(value: str) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 1
+    text = text.replace("页", "").strip()
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise RuntimeError(f"自动添加视频页数无效：{value}") from exc
+    if count <= 0:
+        raise RuntimeError("自动添加视频页数必须大于 0。")
     return count
 
 
@@ -3234,6 +3609,73 @@ async def select_video_cards_within_current_page_until(page: Page, target_count:
     return await current_video_selected_count(page)
 
 
+async def select_video_cards_with_recovery_until(page: Page, target_count: int) -> int:
+    best_count = await current_video_selected_count(page)
+    for attempt in range(3):
+        selected_count = await select_video_cards_within_current_page_until(page, target_count)
+        best_count = max(best_count, selected_count)
+        if selected_count >= target_count:
+            return selected_count
+
+        if attempt < 2:
+            recovered = await recover_video_material_list_for_retry(page)
+            if not recovered:
+                break
+    return max(best_count, await current_video_selected_count(page))
+
+
+async def recover_video_material_list_for_retry(page: Page) -> bool:
+    reloaded = await reload_video_material_current_page(page)
+    await reset_video_material_list_scroll(page)
+    try:
+        await wait_for_video_cards_loaded(page)
+    except RuntimeError:
+        return False
+    await polite_pause(page, 400 if reloaded else 250)
+    return True
+
+
+async def reload_video_material_current_page(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const drawers = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => isVisible(node) && (node.innerText || node.textContent || '').includes('本页全选'));
+                const drawer = drawers.at(-1);
+                if (!drawer) return false;
+                const buttons = Array.from(drawer.querySelectorAll('button, [role="button"], .i-icon, svg'))
+                    .filter(isVisible);
+                const reloadButton = buttons.find(node => {
+                    const text = (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                    const title = node.getAttribute?.('title') || node.getAttribute?.('aria-label') || '';
+                    const className = node.className?.toString?.() || '';
+                    return text === '刷新'
+                        || title.includes('刷新')
+                        || title.toLowerCase().includes('reload')
+                        || /refresh|reload/i.test(className);
+                });
+                if (!reloadButton) return false;
+                const clickable = reloadButton.closest('button, [role="button"]') || reloadButton;
+                clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                return true;
+            }"""
+        )
+    )
+
+
 async def reset_video_material_list_scroll(page: Page) -> None:
     await page.evaluate(
         """() => {
@@ -3498,11 +3940,8 @@ async def wait_for_video_selection_applied(page: Page, count: int) -> None:
                 )).filter(node => {
                     const dialogText = node.innerText || node.textContent || '';
                     return isVisible(node)
-                        && (
-                            dialogText.includes('本页全选')
-                            || dialogText.includes('添加引导视频')
-                            || (dialogText.includes('批量关联') && dialogText.includes('已关联'))
-                        );
+                        && dialogText.includes('本页全选')
+                        && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(dialogText);
                 });
                 if (activeVideoDialogs.length > 0) return false;
                 if (text.includes(`视频 (${count}个)`) || text.includes(`视频(${count}个)`)) return true;
@@ -3556,7 +3995,7 @@ async def wait_for_video_selection_applied(page: Page, count: int) -> None:
                 return
             except PlaywrightTimeoutError:
                 pass
-        if await video_selection_already_applied(page):
+        if await video_selection_already_applied(page) or await page_after_video_guide_is_usable(page):
             return
         raise exc
 
@@ -3603,24 +4042,22 @@ async def video_selection_already_applied(page: Page) -> bool:
                         && style.visibility !== 'hidden';
                 };
                 const text = document.body?.innerText || '';
-                const activeVideoDialogs = Array.from(document.querySelectorAll(
+                const activeMaterialDialogs = Array.from(document.querySelectorAll(
                     '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
                 )).filter(node => {
                     const dialogText = node.innerText || node.textContent || '';
                     return isVisible(node)
-                        && (
-                            dialogText.includes('本页全选')
-                            || dialogText.includes('添加引导视频')
-                            || (dialogText.includes('批量关联') && dialogText.includes('已关联'))
-                        );
+                        && dialogText.includes('本页全选')
+                        && /已选择\\s*\\d+\\s*\\/\\s*\\d+/.test(dialogText);
                 });
-                if (activeVideoDialogs.length > 0) return false;
+                if (activeMaterialDialogs.length > 0) return false;
                 const hasCreateSubmit = Array.from(document.querySelectorAll('button, [role="button"]'))
                     .filter(isVisible)
                     .some(node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').includes('发布项目'));
                 const hasVideoPreview = Array.from(document.querySelectorAll('video, .oc-video-player, [data-auto-id="oc-video-player"]'))
                     .some(isVisible);
-                return hasCreateSubmit && text.includes('素材预览') && hasVideoPreview;
+                const hasSelectedVideoText = /视频\\s*\\([1-9]\\d*个\\)/.test(text);
+                return hasCreateSubmit && text.includes('素材预览') && (hasVideoPreview || hasSelectedVideoText);
             }"""
         )
     )
@@ -3704,32 +4141,128 @@ async def wait_for_video_guide_drawer(page: Page, timeout: int) -> bool:
 
 
 async def wait_for_video_guide_closed(page: Page) -> None:
-    await page.wait_for_function(
-        """() => {
-            const isVisible = node => {
-                const rect = node.getBoundingClientRect();
-                const style = window.getComputedStyle(node);
-                return rect.width > 0
-                    && rect.height > 0
-                    && rect.bottom > 0
-                    && rect.top < window.innerHeight
-                    && style.display !== 'none'
-                    && style.visibility !== 'hidden';
-            };
-            return !Array.from(document.querySelectorAll(
-                '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
-            )).some(node => {
-                const text = node.innerText || node.textContent || '';
-                return isVisible(node)
-                    && text.includes('批量关联')
-                    && (
-                        text.includes('添加引导视频')
-                        || text.includes('引导视频')
-                        || text.includes('已关联')
-                    );
-            });
-        }""",
-        timeout=10_000,
+    for _ in range(2):
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const isVisible = node => {
+                        const rect = node.getBoundingClientRect();
+                        const style = window.getComputedStyle(node);
+                        return rect.width > 0
+                            && rect.height > 0
+                            && rect.bottom > 0
+                            && rect.top < window.innerHeight
+                            && style.display !== 'none'
+                            && style.visibility !== 'hidden';
+                    };
+                    const text = document.body?.innerText || '';
+                    const activeGuideDialogs = Array.from(document.querySelectorAll(
+                        '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                    )).filter(node => {
+                        const dialogText = node.innerText || node.textContent || '';
+                        return isVisible(node)
+                            && dialogText.includes('批量关联')
+                            && (
+                                dialogText.includes('添加引导视频')
+                                || dialogText.includes('引导视频')
+                                || dialogText.includes('已关联')
+                            );
+                    });
+                    if (activeGuideDialogs.length <= 0) return true;
+
+                    const hasCreateSubmit = Array.from(document.querySelectorAll('button, [role="button"]'))
+                        .filter(isVisible)
+                        .some(node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').includes('发布项目'));
+                    const hasVideoPreview = Array.from(document.querySelectorAll('video, .oc-video-player, [data-auto-id="oc-video-player"]'))
+                        .some(isVisible);
+                    const hasSelectedVideoText = /视频\\s*\\([1-9]\\d*个\\)/.test(text);
+                    return hasCreateSubmit && text.includes('素材预览') && (hasVideoPreview || hasSelectedVideoText);
+                }""",
+                timeout=10_000,
+            )
+            return
+        except PlaywrightTimeoutError:
+            if await page_after_video_guide_is_usable(page):
+                return
+            await dismiss_video_guide_overlay_if_possible(page)
+            await polite_pause(page, 700)
+
+    if await page_after_video_guide_is_usable(page):
+        return
+    raise RuntimeError("添加引导视频分支已确认，但等待关闭超时。")
+
+
+async def page_after_video_guide_is_usable(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const text = document.body?.innerText || '';
+                const hasCreateSubmit = Array.from(document.querySelectorAll('button, [role="button"]'))
+                    .filter(isVisible)
+                    .some(node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').includes('发布项目'));
+                const hasVideoPreview = Array.from(document.querySelectorAll('video, .oc-video-player, [data-auto-id="oc-video-player"]'))
+                    .some(isVisible);
+                const hasSelectedVideoText = /视频\\s*\\([1-9]\\d*个\\)/.test(text);
+                return hasCreateSubmit && text.includes('素材预览') && (hasVideoPreview || hasSelectedVideoText);
+            }"""
+        )
+    )
+
+
+async def dismiss_video_guide_overlay_if_possible(page: Page) -> bool:
+    return bool(
+        await page.evaluate(
+            """() => {
+                const isVisible = node => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return rect.width > 0
+                        && rect.height > 0
+                        && rect.bottom > 0
+                        && rect.top < window.innerHeight
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden';
+                };
+                const clean = node => (node.innerText || node.textContent || '').replace(/\\s+/g, '').trim();
+                const dialogs = Array.from(document.querySelectorAll(
+                    '.ovui-drawer__wrap, .ovui-drawer, .ovui-modal, .byted-modal, .byted-drawer-dialog, [role="dialog"]'
+                )).filter(node => {
+                    const text = node.innerText || node.textContent || '';
+                    return isVisible(node)
+                        && text.includes('批量关联')
+                        && (
+                            text.includes('添加引导视频')
+                            || text.includes('引导视频')
+                            || text.includes('已关联')
+                        );
+                });
+                const dialog = dialogs.at(-1);
+                if (!dialog) return false;
+                const confirm = Array.from(dialog.querySelectorAll('button, [role="button"]'))
+                    .filter(node => isVisible(node) && clean(node) === '确定' && !node.disabled)
+                    .at(-1);
+                if (confirm) {
+                    confirm.click();
+                    return true;
+                }
+                const close = Array.from(dialog.querySelectorAll(
+                    'button, [role="button"], .ovui-drawer__close, .ovui-modal__close, .byted-modal-close, .i-icon-close'
+                )).filter(isVisible).at(-1);
+                if (!close) return false;
+                close.click();
+                return true;
+            }"""
+        )
     )
 
 
@@ -4061,8 +4594,52 @@ async def click_video_guide_confirm(page: Page) -> None:
     await confirm.last.click()
 
 
-async def submit_ad_project(page: Page) -> None:
+async def submit_ad_project(
+    page: Page,
+    project_name: str,
+    retry_count: int = 0,
+    retry_interval_seconds: float = 5.0,
+    progress: ProgressCallback | None = None,
+) -> None:
     before_url = page.url
+    max_attempts = max(1, retry_count + 1)
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            if progress is not None:
+                progress(
+                    f"提交项目失败后重试：等待 {retry_interval_seconds:g} 秒后第 {attempt}/{retry_count} 次重新提交。",
+                )
+            await dismiss_submit_validation_message(page)
+            if retry_interval_seconds > 0:
+                await polite_pause(page, int(retry_interval_seconds * 1000))
+
+        try:
+            await submit_ad_project_once(page, before_url, project_name, progress)
+            if attempt > 0 and progress is not None:
+                progress(f"提交项目重试成功：第 {attempt}/{retry_count} 次重新提交后成功。")
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_attempts - 1:
+                break
+            if await project_list_shows_submitted_project(page, project_name):
+                if progress is not None:
+                    progress("提交项目结果确认：重试前检测到项目已提交成功，继续下一个账号。")
+                return
+            if progress is not None:
+                progress(f"提交项目失败：{summarize_submit_error(exc)}")
+
+    if last_error is not None:
+        raise last_error
+
+
+async def submit_ad_project_once(
+    page: Page,
+    before_url: str,
+    project_name: str,
+    progress: ProgressCallback | None = None,
+) -> None:
     await scroll_to_submit_area(page)
     if not await click_submit_project_button(page):
         submit = page.get_by_role("button", name="发布项目")
@@ -4071,7 +4648,70 @@ async def submit_ad_project(page: Page) -> None:
         await submit.last.click(timeout=5_000)
     await polite_pause(page, 800)
     await confirm_submit_project_if_prompted(page)
-    await wait_for_submit_project_result(page, before_url)
+    await wait_for_submit_project_result(page, before_url, project_name, progress)
+
+
+def normalize_submit_retry_count(value: str) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        count = int(text)
+    except ValueError as exc:
+        raise RuntimeError(f"项目失败重新提交次数无效：{value}") from exc
+    if count < 0:
+        raise RuntimeError("项目失败重新提交次数不能小于 0。")
+    return count
+
+
+def normalize_submit_retry_interval_seconds(value: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 5.0
+    try:
+        seconds = float(text)
+    except ValueError as exc:
+        raise RuntimeError(f"重新提交间隔秒数无效：{value}") from exc
+    if seconds < 0:
+        raise RuntimeError("重新提交间隔秒数不能小于 0。")
+    return seconds
+
+
+def summarize_submit_error(error: Exception) -> str:
+    message = str(error).strip().replace("\r\n", "\n")
+    first_line = next((line.strip() for line in message.split("\n") if line.strip()), "")
+    return first_line or error.__class__.__name__
+
+
+async def dismiss_submit_validation_message(page: Page) -> None:
+    try:
+        await page.keyboard.press("Escape")
+    except PlaywrightError:
+        pass
+    await page.evaluate(
+        """() => {
+            const isVisible = node => {
+                const rect = node.getBoundingClientRect();
+                const style = window.getComputedStyle(node);
+                return rect.width > 0
+                    && rect.height > 0
+                    && style.display !== 'none'
+                    && style.visibility !== 'hidden';
+            };
+            const textOf = node => (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+            const candidates = Array.from(document.querySelectorAll(
+                '.ovui-message, .ovui-toast, .byted-toast, .byted-message, .oc-message, [role="alert"], .ovui-popover, .byted-popover'
+            )).filter(node => isVisible(node) && /失败|错误|异常|请检查|未能生成|校验/.test(textOf(node)));
+            for (const node of candidates) {
+                const close = Array.from(node.querySelectorAll(
+                    'button, [role="button"], .ovui-icon, .ovui-popover__close, .byted-icon, svg'
+                )).filter(isVisible).at(-1);
+                close?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+            return true;
+        }"""
+    )
+    await polite_pause(page, 300)
 
 
 async def confirm_submit_project_if_prompted(page: Page) -> None:
@@ -4258,6 +4898,12 @@ async def click_submit_confirm_button(page: Page) -> bool:
 
 async def raise_submit_validation_error_if_any(page: Page) -> None:
     await polite_pause(page, 1200)
+    message = await get_submit_validation_message(page)
+    if message:
+        raise RuntimeError(f"提交失败，页面提示：{message}")
+
+
+async def get_submit_validation_message(page: Page) -> str:
     message = await page.evaluate(
         """() => {
             const isVisible = node => {
@@ -4288,28 +4934,102 @@ async def raise_submit_validation_error_if_any(page: Page) -> None:
             return text || '';
         }"""
     )
-    if message:
-        raise RuntimeError(f"提交失败，页面提示：{message}")
+    return str(message or "").strip()
 
 
-async def wait_for_submit_project_result(page: Page, before_url: str) -> None:
+def is_submit_network_anomaly(message: str) -> bool:
+    normalized = message.replace(" ", "")
+    return "网络异常" in normalized and "刷新重试" in normalized
+
+
+async def mark_submit_network_anomaly_if_any(
+    page: Page,
+    progress: ProgressCallback | None = None,
+) -> bool:
+    await polite_pause(page, 1200)
+    message = await get_submit_validation_message(page)
+    if not message or not is_submit_network_anomaly(message):
+        return False
+    if progress is not None:
+        progress(f"提交项目结果标记：{message}；按投放成功处理并继续下一个账号。")
+    return True
+
+
+async def project_list_shows_submitted_project(page: Page, project_name: str) -> bool:
+    project_name = project_name.strip()
+    return bool(
+        await page.evaluate(
+            """projectName => {
+                const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+                const bodyText = clean(document.body?.innerText || document.body?.textContent || '');
+                if (!bodyText) return false;
+
+                const currentUrl = location.href;
+                const hasCreateForm = bodyText.includes('营销目的与场景')
+                    && bodyText.includes('投放标的')
+                    && bodyText.includes('素材设置')
+                    && bodyText.includes('发布项目');
+                const hasBlockingValidation = /请检查以下选项|无法重复创建|未能生成视频素材id|唯一性校验未通过/.test(bodyText);
+                if (hasCreateForm && hasBlockingValidation) return false;
+
+                const hasProjectListChrome = bodyText.includes('新建项目')
+                    && bodyText.includes('项目名称')
+                    && (bodyText.includes('项目状态') || bodyText.includes('投放设置'));
+                const hasSubmittedStatus = /新建审核中|审核中|未投放/.test(bodyText);
+                const hasProjectName = Boolean(projectName) && bodyText.includes(projectName);
+                const hasProjectPrefix = Boolean(projectName)
+                    && projectName.length >= 12
+                    && bodyText.includes(projectName.slice(0, Math.min(projectName.length, 24)));
+
+                if (hasProjectListChrome && hasSubmittedStatus && (hasProjectName || hasProjectPrefix)) return true;
+                if (!currentUrl.includes('/ad/create') && hasProjectListChrome && hasSubmittedStatus) return true;
+                return false;
+            }""",
+            arg=project_name,
+        )
+    )
+
+
+async def wait_for_submit_project_result(
+    page: Page,
+    before_url: str,
+    project_name: str,
+    progress: ProgressCallback | None = None,
+) -> None:
+    if await mark_submit_network_anomaly_if_any(page, progress):
+        return
     await raise_submit_validation_error_if_any(page)
     try:
         await page.wait_for_function(
-            """beforeUrl => {
+            """({ beforeUrl, projectName }) => {
                 const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ');
                 const successPattern = /提交成功|发布成功|创建成功|已提交|已发布|审核中|项目创建成功|广告创建成功/;
                 if (successPattern.test(bodyText)) return true;
+                const hasProjectListChrome = bodyText.includes('新建项目')
+                    && bodyText.includes('项目名称')
+                    && (bodyText.includes('项目状态') || bodyText.includes('投放设置'));
+                const hasSubmittedStatus = /新建审核中|审核中|未投放/.test(bodyText);
+                const hasProjectName = Boolean(projectName) && bodyText.includes(projectName);
+                const hasProjectPrefix = Boolean(projectName)
+                    && projectName.length >= 12
+                    && bodyText.includes(projectName.slice(0, Math.min(projectName.length, 24)));
+                if (hasProjectListChrome && hasSubmittedStatus && (hasProjectName || hasProjectPrefix)) return true;
                 const currentUrl = location.href;
                 if (currentUrl !== beforeUrl && !currentUrl.includes('/ad/create')) return true;
                 return false;
             }""",
-            arg=before_url,
+            arg={"beforeUrl": before_url, "projectName": project_name},
             timeout=20_000,
         )
         return
     except PlaywrightTimeoutError:
         pass
+    if await project_list_shows_submitted_project(page, project_name):
+        if progress is not None:
+            progress("提交项目结果确认：已回到项目列表并检测到新建审核中项目，按提交成功处理。")
+        return
+    if await mark_submit_network_anomaly_if_any(page, progress):
+        return
     await raise_submit_validation_error_if_any(page)
     raise RuntimeError("提交项目后未检测到成功提示或页面跳转，已停止批量运行以避免误标记账户完成。")
 

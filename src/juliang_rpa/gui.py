@@ -4,6 +4,7 @@ import asyncio
 import csv
 from dataclasses import replace
 from dataclasses import fields
+from datetime import datetime
 import queue
 import threading
 import tkinter as tk
@@ -47,10 +48,13 @@ FIELD_SPECS: tuple[tuple[str, str, str], ...] = (
     ("product_image_path", "产品主图图片", "file"),
     ("auto_add_videos", "自动添加视频", "checkbox"),
     ("auto_add_video_count", "自动添加视频数量", "choice"),
+    ("auto_add_video_pages", "自动添加视频页数", "entry"),
     ("specific_video_count", "指定添加视频数量", "entry"),
     ("change_douyin_nickname", "修改自定义抖音号昵称", "checkbox"),
     ("douyin_nickname", "自定义抖音号昵称", "entry"),
     ("submit_project", "提交项目", "checkbox"),
+    ("submit_retry_count", "项目失败重新提交次数", "entry"),
+    ("submit_retry_interval_seconds", "重新提交间隔秒数", "entry"),
     ("product_selling_points", "产品卖点", "entry"),
     ("call_to_actions", "行动号召", "entry"),
     ("project_name_prefix", "项目名称前缀", "entry"),
@@ -95,6 +99,10 @@ class JuliangRpaApp(tk.Tk):
         self._init_field_vars()
         self.account_queue_index = 0
         self.completed_account_ids: set[str] = set()
+        self.failed_account_ids: set[str] = set()
+        self.failed_account_errors: dict[str, str] = {}
+        self.batch_pause_requested = threading.Event()
+        self.batch_running = False
         self.batch_delay_var = tk.StringVar(value="8")
         self.account_queue_widgets: list[tk.Widget] = []
         self._build_ui()
@@ -220,7 +228,7 @@ class JuliangRpaApp(tk.Tk):
         self.account_queue_listbox.bind("<<ListboxSelect>>", self._on_account_listbox_select)
         nav = ttk.Frame(right_queue)
         nav.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        for index in range(5):
+        for index in range(8):
             nav.columnconfigure(index, weight=1)
         self.prev_account_button = ttk.Button(nav, text="上一个账户", command=self.previous_account)
         self.prev_account_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -228,15 +236,24 @@ class JuliangRpaApp(tk.Tk):
         self.next_account_button.grid(row=0, column=1, sticky="ew", padx=6)
         self.clear_account_marks_button = ttk.Button(nav, text="清除完成标记", command=self.clear_account_marks)
         self.clear_account_marks_button.grid(row=0, column=2, sticky="ew", padx=6)
-        ttk.Label(nav, text="账号间等待(秒)").grid(row=0, column=3, sticky="e", padx=(8, 4))
+        self.pause_batch_button = ttk.Button(nav, text="暂停批处理", command=self.request_pause_batch)
+        self.pause_batch_button.grid(row=0, column=3, sticky="ew", padx=6)
+        self.pause_batch_button.configure(state=tk.DISABLED)
+        self.retry_failed_accounts_button = ttk.Button(nav, text="一键重试失败账号", command=self.retry_failed_accounts)
+        self.retry_failed_accounts_button.grid(row=0, column=4, sticky="ew", padx=6)
+        self.export_failed_accounts_button = ttk.Button(nav, text="导出失败账号", command=self.export_failed_accounts)
+        self.export_failed_accounts_button.grid(row=0, column=5, sticky="ew", padx=6)
+        ttk.Label(nav, text="账号间等待(秒)").grid(row=0, column=6, sticky="e", padx=(8, 4))
         self.batch_delay_entry = ttk.Entry(nav, textvariable=self.batch_delay_var, width=6)
-        self.batch_delay_entry.grid(row=0, column=4, sticky="w")
+        self.batch_delay_entry.grid(row=0, column=7, sticky="w")
         self.account_queue_widgets.extend(
             [
-                self.account_queue_listbox,
                 self.prev_account_button,
                 self.next_account_button,
                 self.clear_account_marks_button,
+                self.pause_batch_button,
+                self.retry_failed_accounts_button,
+                self.export_failed_accounts_button,
                 self.batch_delay_entry,
             ]
         )
@@ -415,6 +432,7 @@ class JuliangRpaApp(tk.Tk):
             return
         self._sync_account_list_from_text()
         self._refresh_browser_settings()
+        self.batch_pause_requested.clear()
         start_index = min(max(self.account_queue_index, 0), len(account_ids) - 1)
         base_values = self._form_values()
         self._run_single(
@@ -426,6 +444,57 @@ class JuliangRpaApp(tk.Tk):
                 delay_seconds=self._batch_delay_seconds(),
             ),
         )
+
+    def retry_failed_accounts(self) -> None:
+        all_account_ids = self._account_ids_from_queue()
+        failed_ids = [account_id for account_id in all_account_ids if account_id in self.failed_account_ids]
+        if not failed_ids:
+            messagebox.showinfo("没有失败账号", "当前账户队列中没有失败账号可重试。")
+            return
+        self._refresh_browser_settings()
+        self.batch_pause_requested.clear()
+        base_values = self._form_values()
+        self._run_single(
+            "retry-failed-new-ad",
+            lambda: self._run_batch_new_ad_task(
+                account_ids=failed_ids,
+                start_index=0,
+                base_values=base_values,
+                delay_seconds=self._batch_delay_seconds(),
+            ),
+        )
+
+    def request_pause_batch(self) -> None:
+        if not self.batch_running:
+            self._log("当前没有正在运行的批处理。")
+            return
+        if self.batch_pause_requested.is_set():
+            return
+        self.batch_pause_requested.set()
+        self._log("已请求暂停批处理：当前账号处理完成后停止，不再继续后续账号。")
+        self.status_var.set("批处理将在当前账号完成后暂停")
+
+    def export_failed_accounts(self) -> None:
+        account_ids = [account_id for account_id in self._account_ids_from_queue() if account_id in self.failed_account_ids]
+        if not account_ids:
+            messagebox.showinfo("没有失败账号", "当前账户队列中没有失败账号可导出。")
+            return
+        default_name = f"失败账号_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        path = filedialog.asksaveasfilename(
+            title="导出失败账号",
+            initialfile=default_name,
+            defaultextension=".csv",
+            filetypes=(("CSV 文件", "*.csv"), ("文本文件", "*.txt"), ("所有文件", "*.*")),
+        )
+        if not path:
+            return
+        target = Path(path)
+        with target.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["account_id", "error"])
+            for account_id in account_ids:
+                writer.writerow([account_id, self.failed_account_errors.get(account_id, "")])
+        self._log(f"已导出失败账号：{target}")
 
     def previous_account(self) -> None:
         account_ids = self._account_ids_from_queue()
@@ -443,6 +512,8 @@ class JuliangRpaApp(tk.Tk):
 
     def clear_account_marks(self) -> None:
         self.completed_account_ids.clear()
+        self.failed_account_ids.clear()
+        self.failed_account_errors.clear()
         self._refresh_account_queue_view()
 
     def choose_file(self, field_name: str) -> None:
@@ -675,10 +746,13 @@ class JuliangRpaApp(tk.Tk):
             product_image_path=values["product_image_path"],
             auto_add_videos=self._truthy_config_value(values["auto_add_videos"]),
             auto_add_video_count=values["auto_add_video_count"],
+            auto_add_video_pages=values["auto_add_video_pages"],
             specific_video_count=values["specific_video_count"],
             change_douyin_nickname=self._truthy_config_value(values["change_douyin_nickname"]),
             douyin_nickname=values["douyin_nickname"],
             submit_project=self._truthy_config_value(values["submit_project"]),
+            submit_retry_count=values["submit_retry_count"],
+            submit_retry_interval_seconds=values["submit_retry_interval_seconds"],
             product_selling_points=values["product_selling_points"],
             call_to_actions=values["call_to_actions"],
             project_name_prefix=values["project_name_prefix"],
@@ -754,7 +828,13 @@ class JuliangRpaApp(tk.Tk):
         else:
             self.account_queue_index = 0
             self.completed_account_ids.clear()
+            self.failed_account_ids.clear()
+            self.failed_account_errors.clear()
         self.completed_account_ids = {account_id for account_id in self.completed_account_ids if account_id in account_ids}
+        self.failed_account_ids = {account_id for account_id in self.failed_account_ids if account_id in account_ids}
+        self.failed_account_errors = {
+            account_id: error for account_id, error in self.failed_account_errors.items() if account_id in account_ids
+        }
         self._refresh_account_queue_view(account_ids)
 
     def _apply_current_account_from_queue(self, account_ids: list[str] | None = None) -> None:
@@ -772,11 +852,19 @@ class JuliangRpaApp(tk.Tk):
             account_ids = self._account_ids_from_queue()
         if not hasattr(self, "account_queue_listbox"):
             return
+        listbox_state = str(self.account_queue_listbox.cget("state"))
+        if listbox_state != tk.NORMAL:
+            self.account_queue_listbox.configure(state=tk.NORMAL)
         self.account_queue_listbox.delete(0, tk.END)
         total = len(account_ids)
         self.account_queue_index = min(max(self.account_queue_index, 0), max(total - 1, 0))
         for index, account_id in enumerate(account_ids):
-            marker = "✓" if account_id in self.completed_account_ids else " "
+            if account_id in self.completed_account_ids:
+                marker = "✓"
+            elif account_id in self.failed_account_ids:
+                marker = "✗"
+            else:
+                marker = " "
             current = "▶" if total and index == self.account_queue_index else " "
             self.account_queue_listbox.insert(tk.END, f"{current} {marker} {index + 1}. {account_id}")
         if total:
@@ -784,8 +872,11 @@ class JuliangRpaApp(tk.Tk):
             self.account_queue_listbox.selection_set(self.account_queue_index)
             self.account_queue_listbox.see(self.account_queue_index)
         completed = sum(1 for account_id in account_ids if account_id in self.completed_account_ids)
+        failed = sum(1 for account_id in account_ids if account_id in self.failed_account_ids)
         current_number = self.account_queue_index + 1 if total else 0
-        self.account_queue_status_var.set(f"账户 {current_number}/{total}，已完成 {completed}/{total}")
+        self.account_queue_status_var.set(f"账户 {current_number}/{total}，已完成 {completed}/{total}，失败 {failed}/{total}")
+        if listbox_state != tk.NORMAL:
+            self.account_queue_listbox.configure(state=listbox_state)
 
     def _on_account_listbox_select(self, _event: tk.Event) -> None:
         if self.busy:
@@ -935,6 +1026,30 @@ class JuliangRpaApp(tk.Tk):
                 self._emit("done", f"{label} 已完成")
             return
 
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                await self._run_new_ad_task_attempt_async(options)
+                if emit_done:
+                    self._emit("account_queue_completed_by_id", options.account_id)
+                    self._emit("done", f"{label} 已完成")
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt > 0 or not self._should_retry_new_ad_account(exc):
+                    raise
+                self._emit(
+                    "log",
+                    f"账户 {options.account_id} 遇到可恢复问题：{self._summarize_new_ad_error(exc)}；"
+                    "刷新该账户页后自动重试 1 次。",
+                )
+                await self._close_ad_browser_context()
+                await asyncio.sleep(1)
+
+        if last_error is not None:
+            raise last_error
+
+    async def _run_new_ad_task_attempt_async(self, options: NewAdOptions) -> None:
         context = await self._ad_browser_context()
         try:
             page = await fresh_page(context)
@@ -950,9 +1065,21 @@ class JuliangRpaApp(tk.Tk):
             progress=lambda message: self._emit("log", message),
         )
         self._emit("log", "新建广告页面已保留在当前浏览器。下次运行会自动清理旧标签页。")
-        if emit_done:
-            self._emit("account_queue_completed_by_id", options.account_id)
-            self._emit("done", f"{label} 已完成")
+
+    @staticmethod
+    def _should_retry_new_ad_account(error: Exception) -> bool:
+        message = str(error)
+        if "视频列表加载超时，未出现可选择的视频卡片" in message:
+            return True
+        if "事件下拉列表中找不到精确选项" in message:
+            return True
+        return "投放产品与载体" in message and "Timeout" in message
+
+    @staticmethod
+    def _summarize_new_ad_error(error: Exception) -> str:
+        message = str(error).strip().replace("\r\n", "\n")
+        first_line = next((line.strip() for line in message.split("\n") if line.strip()), "")
+        return first_line or error.__class__.__name__
 
     async def _run_batch_new_ad_task_async(
         self,
@@ -962,19 +1089,48 @@ class JuliangRpaApp(tk.Tk):
         delay_seconds: float,
     ) -> None:
         total = len(account_ids)
+        self._emit("batch_running", "true")
         self._emit("status", f"正在批量创建广告：从第 {start_index + 1}/{total} 个账户开始...")
-        for index in range(start_index, total):
-            account_id = account_ids[index]
-            self._emit("account_queue_current", str(index))
-            self._emit("log", f"批量创建：开始第 {index + 1}/{total} 个账户，账户 ID: {account_id}")
-            options = self._options_from_values(base_values, account_id=account_id, dry_run=False)
-            await self._run_new_ad_task_async(options=options, emit_done=False)
-            self._emit("account_queue_completed_by_id", account_id)
-            self._emit("log", f"批量创建：第 {index + 1}/{total} 个账户已完成。")
-            if index < total - 1 and delay_seconds > 0:
-                self._emit("log", f"等待 {delay_seconds:g} 秒，确认上一个账户创建完成后进入下一个账户。")
-                await asyncio.sleep(delay_seconds)
-        self._emit("done", f"批量创建广告 已完成：{total - start_index}/{total}")
+        completed_count = 0
+        failed_count = 0
+        paused = False
+        try:
+            for index in range(start_index, total):
+                if self.batch_pause_requested.is_set():
+                    paused = True
+                    self._emit("log", "批量创建：已按暂停请求停止，未继续后续账户。")
+                    break
+                account_id = account_ids[index]
+                self._emit("account_queue_current_by_id", account_id)
+                self._emit("log", f"批量创建：开始第 {index + 1}/{total} 个账户，账户 ID: {account_id}")
+                options = self._options_from_values(base_values, account_id=account_id, dry_run=False)
+                try:
+                    await self._run_new_ad_task_async(options=options, emit_done=False)
+                except Exception as exc:  # noqa: BLE001 - keep batch running and record per-account failure.
+                    failed_count += 1
+                    error = self._summarize_new_ad_error(exc)
+                    self._emit("account_queue_failed", f"{account_id}\t{error}")
+                    self._emit("log", f"批量创建：第 {index + 1}/{total} 个账户失败，账户 ID: {account_id}，错误：{error}")
+                    await self._close_ad_browser_context()
+                else:
+                    completed_count += 1
+                    self._emit("account_queue_completed_by_id", account_id)
+                    self._emit("log", f"批量创建：第 {index + 1}/{total} 个账户已完成。")
+                if self.batch_pause_requested.is_set():
+                    paused = True
+                    self._emit("log", "批量创建：当前账户处理完成，已暂停后续批处理。")
+                    break
+                if index < total - 1 and delay_seconds > 0:
+                    self._emit("log", f"等待 {delay_seconds:g} 秒后进入下一个账户。")
+                    await asyncio.sleep(delay_seconds)
+            status = "已暂停" if paused else "已完成"
+            self._emit(
+                "done",
+                f"批量创建广告 {status}：成功 {completed_count}/{total - start_index}，失败 {failed_count}/{total - start_index}",
+            )
+        finally:
+            self.batch_pause_requested.clear()
+            self._emit("batch_running", "false")
 
     async def _ad_browser_context(self) -> BrowserContext:
         if self.ad_context is not None:
@@ -1002,6 +1158,12 @@ class JuliangRpaApp(tk.Tk):
                 elif event_type == "status":
                     self.status_var.set(message)
                     self._log(message)
+                elif event_type == "batch_running":
+                    self.batch_running = message == "true"
+                    if hasattr(self, "pause_batch_button"):
+                        self.pause_batch_button.configure(
+                            state=tk.NORMAL if self.batch_running else tk.DISABLED,
+                        )
                 elif event_type == "done":
                     self.status_var.set(message)
                     self._log(message)
@@ -1016,6 +1178,12 @@ class JuliangRpaApp(tk.Tk):
                     if account_ids and 0 <= self.account_queue_index < len(account_ids):
                         self.field_vars["account_id"].set(account_ids[self.account_queue_index])
                     self._refresh_account_queue_view(account_ids)
+                elif event_type == "account_queue_current_by_id":
+                    account_ids = self._account_ids_from_queue()
+                    if message in account_ids:
+                        self.account_queue_index = account_ids.index(message)
+                        self.field_vars["account_id"].set(message)
+                    self._refresh_account_queue_view(account_ids)
                 elif event_type == "account_queue_completed":
                     account_ids = self._account_ids_from_queue()
                     try:
@@ -1023,14 +1191,31 @@ class JuliangRpaApp(tk.Tk):
                     except ValueError:
                         completed_index = -1
                     if 0 <= completed_index < len(account_ids):
-                        self.completed_account_ids.add(account_ids[completed_index])
+                        account_id = account_ids[completed_index]
+                        self.completed_account_ids.add(account_id)
+                        self.failed_account_ids.discard(account_id)
+                        self.failed_account_errors.pop(account_id, None)
                     self._refresh_account_queue_view(account_ids)
                 elif event_type == "account_queue_completed_by_id":
                     account_ids = self._account_ids_from_queue()
                     if message in account_ids:
                         self.completed_account_ids.add(message)
+                        self.failed_account_ids.discard(message)
+                        self.failed_account_errors.pop(message, None)
                         self.account_queue_index = account_ids.index(message)
                         self.field_vars["account_id"].set(message)
+                    self._refresh_account_queue_view(account_ids)
+                elif event_type == "account_queue_failed":
+                    account_ids = self._account_ids_from_queue()
+                    account_id, _, error = message.partition("\t")
+                    account_id = account_id.strip()
+                    if account_id:
+                        self.failed_account_ids.add(account_id)
+                        self.completed_account_ids.discard(account_id)
+                        self.failed_account_errors[account_id] = error.strip()
+                        if account_id in account_ids:
+                            self.account_queue_index = account_ids.index(account_id)
+                            self.field_vars["account_id"].set(account_id)
                     self._refresh_account_queue_view(account_ids)
                 elif event_type == "account_queue_refresh":
                     self._refresh_account_queue_view()
@@ -1062,6 +1247,8 @@ class JuliangRpaApp(tk.Tk):
         self.preset_combo.configure(state=tk.DISABLED if busy else "readonly")
         for widget in self.account_queue_widgets:
             widget.configure(state=state)
+        if hasattr(self, "pause_batch_button"):
+            self.pause_batch_button.configure(state=tk.NORMAL if self.batch_running else tk.DISABLED)
         for widget in self.field_widgets:
             if isinstance(widget, ttk.Combobox):
                 widget.configure(state=tk.DISABLED if busy else "readonly")
